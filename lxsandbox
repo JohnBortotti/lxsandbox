@@ -56,13 +56,6 @@ in_box() { local b=$1; shift
     -- bash -lc "$*" </dev/null; }
 
 usage() { cat <<'U'
-  +-------+
-  | o   o |   lxsandbox
-  |  ___  |   agents go in, the mess stays in
-  +-------+
-
-lxsandbox, alias lxs. Boxes are LXD containers where Claude Code / Codex run in bypass mode.
-
 lxs status                          overview: golden image, egress proxy, accounts, envs, boxes
                                     (status, ls, ps, env ls|show, egress show|log, account ls take --json)
 
