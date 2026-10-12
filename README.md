@@ -66,11 +66,19 @@ bypass mode inside disposable sandboxes on a Linux host. It's one bash script, `
       lxs egress show web
       lxs egress allow web api.stripe.com '*.supabase.co' myhost:8443
       lxs egress remove web pypi.org
-      lxs egress log -n 20              # ALLOW/DENY per request, to see what a box tried to reach
+      lxs egress log -n 20 --box b1     # ALLOW/DENY per request, to see what a box tried to reach
       lxs egress mode web open          # for boxes created from now on
 
 - `lxs` starts the proxy on demand; `host/lxsandbox-egress.service` keeps it up across reboots.
 - Local MCP servers (`127.0.0.1` urls) and the ssh-agent are LXD proxy devices, not network, so they keep working.
+
+## Looking around
+`lxs status` shows the golden image, the egress proxy, accounts, envs and boxes at a glance. Listing
+commands (`status`, `ls`, `ps`, `env ls|show`, `egress show|log`, `account ls`) print tables on a terminal
+and take `--json` for scripts:
+
+    lxs ls --json | jq -r '.[] | select(.state == "RUNNING") | .box'
+    lxs env show web --json | jq .allow
 
 ## MCP servers (`--mcp HOOK[:SCOPE]`)
 A hook is an executable in `~/.lxsandbox/hooks/` that mints a credential per box and revokes it when the

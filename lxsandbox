@@ -20,6 +20,35 @@ die() { echo "lxs: $*" >&2; exit 1; }
 q() { printf '%q' "$1"; }
 need_env() { [ -f "$LXSANDBOX_HOME/envs/$1/env.conf" ] || die "no env '$1' (lxs env ls)"; }
 is_box() { [ -n "$(lxc config get "$1" user.lxsandbox.env 2>/dev/null)" ]; }
+
+# ---------- output: tables for people, --json for scripts ----------
+JSON=0
+show() { # show <json array> [empty message] [jq projection of each row for the table]
+  if [ "$JSON" = 1 ]; then jq . <<<"$1"; return; fi
+  if [ "$(jq length <<<"$1")" = 0 ]; then echo "${2:-(none)}"; return; fi
+  jq -r "[.[] | ${3:-.}] | (.[0] | keys_unsorted) as \$k | (\$k | map(ascii_upcase) | @tsv),
+    (.[] | [.[\$k[]] | if type == \"array\" then (if length == 0 then \"-\" else join(\", \") end)
+      elif . == null or . == \"\" then \"-\" else tostring end] | @tsv)" <<<"$1" | table
+}
+show_obj() { # show_obj <json object>: one KEY / VALUE row per field
+  if [ "$JSON" = 1 ]; then jq . <<<"$1"; return; fi
+  show "$(jq -c 'to_entries | map({key, value})' <<<"$1")"
+}
+table() { # TSV with a header row on stdin -> box-drawn table; colors only on a terminal
+  awk -F'\t' -v color="$([ -t 1 ] && echo 1)" '
+    { for (i = 1; i <= NF; i++) { c[NR, i] = $i; if (length($i) > w[i]) w[i] = length($i) }
+      if (NF > nf) nf = NF; n = NR }
+    function rule(l, m, r,   s, i, j) { s = l; for (i = 1; i <= nf; i++) { for (j = 0; j < w[i] + 2; j++) s = s "─"; s = s (i < nf ? m : r) }; print s }
+    function paint(p, v, h) {
+      if (!color) return p
+      if (h) return "\033[1m" p "\033[0m"
+      if (v ~ /^(RUNNING|allowlist|ALLOW|up)$/) return "\033[32m" p "\033[0m"
+      if (v ~ /^(open|DENY|down)$/) return "\033[33m" p "\033[0m"
+      if (v ~ /^(STOPPED|-)$/) return "\033[2m" p "\033[0m"
+      return p }
+    function row(r,   s, i) { s = "│"; for (i = 1; i <= nf; i++) s = s " " paint(sprintf("%-" w[i] "s", c[r, i]), c[r, i], r == 1) " │"; print s }
+    END { rule("┌", "┬", "┐"); row(1); rule("├", "┼", "┤"); for (r = 2; r <= n; r++) row(r); rule("└", "┴", "┘") }'
+}
 wait_up() { for _ in $(seq 30); do lxc exec "$1" -- true 2>/dev/null && return; sleep 1; done; }
 # Run a command in a box as "agent" with a login shell (so ~/.boxenv is loaded).
 in_box() { local b=$1; shift
@@ -33,6 +62,9 @@ usage() { cat <<'U'
   +-------+
 
 lxsandbox, alias lxs. Boxes are LXD containers where Claude Code / Codex run in bypass mode.
+
+lxs status                          overview: golden image, egress proxy, accounts, envs, boxes
+                                    (status, ls, ps, env ls|show, egress show|log, account ls take --json)
 
 lxs image build                     create/provision the golden container and snapshot it
 lxs image refresh-cli               copy the host's claude + codex binaries into golden
@@ -53,7 +85,7 @@ lxs egress show <env>               network mode and allowlist (allowlist edits 
 lxs egress allow <env> HOST...      HOST = example.com, *.example.com or host:port
 lxs egress remove <env> HOST...
 lxs egress mode <env> allowlist|open   for boxes created from now on
-lxs egress log [-n N]               recent ALLOW/DENY decisions
+lxs egress log [-n N] [--box B]     recent ALLOW/DENY decisions
 
 lxs run <box> claude|codex [--name S] [--cwd DIR] ["prompt"]   start an agent in tmux session S
 lxs ps <box>                        agent sessions in a box
@@ -112,11 +144,18 @@ account() {
       mkdir -p "$d"; chmod 700 "$d"
       CODEX_HOME=$d codex login --device-auth || CODEX_HOME=$d codex login
       [ -f "$d/auth.json" ] && echo "saved $d/auth.json" ;;
-    ls|"")
-      echo "claude:"; ls "$LXSANDBOX_HOME/accounts/claude" 2>/dev/null | sed 's/\.token$//;s/^/  /'
-      echo "codex:";  ls "$LXSANDBOX_HOME/accounts/codex" 2>/dev/null | sed 's/^/  /' ;;
+    ls|"") show "$(accounts_json)" "no accounts (lxs account claude|codex <name>)" ;;
     *) die "lxs account claude|codex <name> | ls" ;;
   esac
+}
+
+accounts_json() {
+  local f k n
+  for f in "$LXSANDBOX_HOME"/accounts/claude/*.token "$LXSANDBOX_HOME"/accounts/codex/*/; do
+    [ -e "$f" ] || continue; k=$(basename "$(dirname "$f")"); n=$(basename "$f" .token)
+    jq -nc --arg k "$k" --arg n "$n" --argjson e "$(envs_json)" \
+      '{agent: $k, account: $n, envs: [$e[] | select((if $k == "claude" then .claude else .codex end) == $n) | .env]}'
+  done | jq -sc .
 }
 
 # ---------- envs ----------
@@ -152,15 +191,29 @@ C
   egress_default > "$d/egress.allow"
   echo "env $e created: $d"
 }
+allow_list() { [ -f "$1" ] && sed -E 's/#.*//; s/^[[:space:]]+//; s/[[:space:]]+$//; /^$/d' "$1" || true; }
+envs_json() {
+  local d boxes; boxes=$(boxes_json 0)
+  for d in "$LXSANDBOX_HOME"/envs/*/; do [ -f "$d/env.conf" ] || continue
+    ( . "$d/env.conf"; e=$(basename "$d")
+      jq -nc --arg env "$e" --arg claude "${CLAUDE_ACCOUNT:-}" --arg codex "${CODEX_ACCOUNT:-}" --arg mcp "${MCP:-}" \
+        --arg github "${GITHUB:-off}" --arg egress "${EGRESS:-open}" --arg repos "${REPOS:-}" \
+        --arg cpu "${CPU:-4}" --arg mem "${MEMORY:-8GiB}" --argjson boxes "$boxes" \
+        --arg secrets "$(grep -c '^[A-Za-z_]' "$d/secrets.env" 2>/dev/null || true)" \
+        --arg allow "$(allow_list "$d/egress.allow")" \
+        '{env: $env, claude: $claude, codex: $codex, mcp: $mcp, github: $github, egress: $egress,
+          allow: ($allow | split("\n") | map(select(. != ""))), repos: ($repos | split(" ") | map(select(. != ""))),
+          cpu: $cpu, memory: $mem, secrets: ($secrets | tonumber? // 0),
+          boxes: [$boxes[] | select(.env == $env) | .box]}' )
+  done | jq -sc .
+}
 env_cmd() {
   local sub=${1:-ls}; shift || true
   case "$sub" in
     new) env_new "$@" ;;
-    ls) for d in "$LXSANDBOX_HOME"/envs/*/; do [ -d "$d" ] || continue
-          ( . "$d/env.conf"; printf '%-16s claude=%-10s codex=%-10s mcp=%-14s github=%-5s egress=%-9s repos=%s\n' "$(basename "$d")" \
-              "${CLAUDE_ACCOUNT:--}" "${CODEX_ACCOUNT:--}" "${MCP:--}" "${GITHUB:-off}" "${EGRESS:-open}" "${REPOS:--}" ); done ;;
-    show) need_env "$1"; cat "$LXSANDBOX_HOME/envs/$1/env.conf"
-          echo "secrets: $(grep -c '^[A-Za-z_]' "$LXSANDBOX_HOME/envs/$1/secrets.env" || true) keys" ;;
+    ls) show "$(envs_json)" "no envs (lxs env new <env>)" \
+          '{env, claude, codex, mcp, github, egress, allowed: (.allow | length), repos, boxes: (.boxes | length)}' ;;
+    show) need_env "${1:?env}"; show_obj "$(envs_json | jq -c --arg e "$1" '.[] | select(.env == $e)')" ;;
     edit) need_env "$1"; "${EDITOR:-vi}" "$LXSANDBOX_HOME/envs/$1/${2:-env.conf}" ;;
     rm) need_env "$1"; local used
         used=$(lxc list -f csv -c n | while read -r n; do
@@ -295,9 +348,10 @@ egress_host() { # normalize a pasted url or host to a pattern
 egress_cmd() {
   local sub=${1:-}; shift || true
   case "$sub" in
-    show) need_env "${1:?env}"; local f="$LXSANDBOX_HOME/envs/$1/egress.allow"
-          ( . "$LXSANDBOX_HOME/envs/$1/env.conf"; echo "mode: ${EGRESS:-open}" )
-          [ -f "$f" ] && grep -v '^\s*#' "$f" | sed '/^\s*$/d;s/^/  /' || echo "  (no allowlist)" ;;
+    show) need_env "${1:?env}"; local mode; mode=$( . "$LXSANDBOX_HOME/envs/$1/env.conf"; echo "${EGRESS:-open}")
+          if [ "$JSON" = 1 ]; then envs_json | jq --arg e "$1" '.[] | select(.env == $e) | {env, egress, allow}'; return; fi
+          echo "env $1: egress $mode$([ "$mode" = open ] && echo " (the list below is not enforced)")"
+          show "$(allow_list "$LXSANDBOX_HOME/envs/$1/egress.allow" | jq -Rnc '[inputs | {host: .}]')" "(empty allowlist)" ;;
     allow|remove)
       local e=${1:?env}; shift; need_env "$e"; local f="$LXSANDBOX_HOME/envs/$e/egress.allow" h
       [ $# -gt 0 ] || die "lxs egress $sub <env> HOST..."
@@ -315,7 +369,10 @@ egress_cmd() {
           if grep -q '^EGRESS=' "$c"; then sed -i -E "s/^EGRESS=[a-z]*/EGRESS=$m/" "$c"; else echo "EGRESS=$m" >> "$c"; fi
           [ -f "$LXSANDBOX_HOME/envs/$e/egress.allow" ] || egress_default > "$LXSANDBOX_HOME/envs/$e/egress.allow"
           echo "env $e: egress $m for new boxes (existing boxes keep their mode)" ;;
-    log) local n=40; [ "${1:-}" = -n ] && n=$2; tail -n "$n" "$LXSANDBOX_HOME/egress.log" 2>/dev/null || true ;;
+    log) local n=40 box=""
+         while [ $# -gt 0 ]; do case "$1" in -n) n=$2; shift 2;; --box) box=$2; shift 2;; *) die "lxs egress log [-n N] [--box B]";; esac; done
+         show "$( { [ -f "$LXSANDBOX_HOME/egress.log" ] && cat "$LXSANDBOX_HOME/egress.log"; } | awk -v b="$box" 'b == "" || $3 == b' \
+           | tail -n "$n" | jq -Rnc '[inputs | split(" ") | {time: (.[0] + " " + .[1]), box: .[2], verdict: .[3], target: .[4]}]')" "(no requests logged)" ;;
     *) die "lxs egress show|allow|remove|mode|log" ;;
   esac
 }
@@ -416,13 +473,38 @@ box_new() {
   echo "box $b ready (env $e). Next: lxs run $b claude \"...\""
 }
 
-box_ls() {
-  printf '%-18s %-8s %-14s %s\n' BOX STATE ENV SESSIONS
-  lxc list -f csv -c n,s | while IFS=, read -r n s; do
-    local e ss="-"; e=$(lxc config get "$n" user.lxsandbox.env 2>/dev/null); [ -n "$e" ] || continue
-    [ "$s" = RUNNING ] && ss=$(in_box "$n" "tmux ls -F '#S' 2>/dev/null || true" | paste -sd, -)
-    printf '%-18s %-8s %-14s %s\n' "$n" "$s" "$e" "${ss:--}"
-  done
+boxes_json() { # boxes_json [with_sessions=1]: one lxc query, plus a tmux look into each running box
+  local all; all=$(lxc list -f json | jq -c '[.[] | select(.config["user.lxsandbox.env"] != null) | {
+      box: .name, state: (.status | ascii_upcase), env: .config["user.lxsandbox.env"],
+      egress: (if .expanded_devices.egress then "allowlist" else "open" end),
+      cpu: (.config["limits.cpu"] // ""), memory: (.config["limits.memory"] // ""),
+      created: (.created_at | sub("\\..*"; "Z") | fromdate | strflocaltime("%Y-%m-%d %H:%M"))}]')
+  [ "${1:-1}" = 1 ] || { echo "$all"; return; }
+  jq -c '.[]' <<<"$all" | while read -r o; do
+    local b s ss=""; b=$(jq -r .box <<<"$o"); s=$(jq -r .state <<<"$o")
+    [ "$s" = RUNNING ] && ss=$(in_box "$b" "tmux ls -F '#S' 2>/dev/null || true" | paste -sd' ' -)
+    jq -c --arg ss "$ss" '. + {sessions: ($ss | split(" ") | map(select(. != "")))}' <<<"$o"
+  done | jq -sc .
+}
+box_ls() { show "$(boxes_json)" "no boxes (lxs new <box> --env <env>)" '{box, state, env, egress, sessions, created}'; }
+box_ps() {
+  show "$(in_box "${1:?box}" "tmux ls -F '#S	#{session_created}	#{session_attached}	#{pane_current_command}' 2>/dev/null || true" \
+    | jq -Rnc '[inputs | split("\t") | {session: .[0], started: (.[1] | tonumber | strflocaltime("%Y-%m-%d %H:%M")),
+                attached: (.[2] != "0"), running: .[3]}]')" "(no sessions)"
+}
+status() {
+  local up=down pid; pid=$(cat "$LXSANDBOX_HOME/egress.pid" 2>/dev/null || true)
+  [ -S "$EGRESS_SOCK" ] && [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null && up=up
+  local golden=missing; lxc query "/1.0/instances/$GOLDEN/snapshots/base" >/dev/null 2>&1 && golden=ready
+  if [ "$JSON" = 1 ]; then
+    jq -n --arg proxy "$up" --arg golden "$golden" --argjson envs "$(envs_json)" --argjson boxes "$(boxes_json)" \
+      --argjson accounts "$(accounts_json)" '{golden: $golden, egress_proxy: $proxy, accounts: $accounts, envs: $envs, boxes: $boxes}'
+    return
+  fi
+  echo "golden image: $golden · egress proxy: $up"
+  echo; echo "accounts"; account ls
+  echo; echo "envs"; env_cmd ls
+  echo; echo "boxes"; box_ls
 }
 
 # ---------- deleting: never lose unpushed work by accident ----------
@@ -486,6 +568,9 @@ agent_logs() { local b=$1 s=$2 n=60; [ "${3:-}" = -n ] && n=$4
   in_box "$b" "tmux capture-pane -p -t $(q "$s") -S -$n"; }
 
 cmd=${1:-help}; shift || true
+case "$cmd" in ls|env|egress|account|ps|status|st) # --json anywhere in the args
+  args=(); for a in "$@"; do if [ "$a" = --json ]; then JSON=1; else args+=("$a"); fi; done
+  set -- ${args[@]+"${args[@]}"} ;; esac
 case "$cmd" in
   image) case "${1:-}" in build) image_build;; refresh-cli) image_refresh_cli;; *) die "lxs image build|refresh-cli";; esac ;;
   account) account "$@" ;;
@@ -493,6 +578,7 @@ case "$cmd" in
   egress) egress_cmd "$@" ;;
   new) box_new "$@" ;;
   ls) box_ls ;;
+  status|st) status ;;
   rm) box_rm "$@" ;;
   prune) box_prune "$@" ;;
   stop) lxc stop "${1:?box}" ;;
@@ -500,7 +586,7 @@ case "$cmd" in
   shell) lxc exec "${1:?box}" -- sudo -iu agent ;;
   snap) lxc snapshot "${1:?box}" ${2:+"$2"} ;;
   run) agent_run "$@" ;;
-  ps) in_box "${1:?box}" 'tmux ls 2>/dev/null || echo "(no sessions)"' ;;
+  ps) box_ps "$@" ;;
   send) agent_send "${1:?box}" "${2:?session}" "${3:?text}" ;;
   logs) agent_logs "$@" ;;
   attach) lxc exec "${1:?box}" -t -- sudo -iu agent tmux attach -t "${2:?session}" ;;
