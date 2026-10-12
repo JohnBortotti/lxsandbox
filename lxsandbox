@@ -26,12 +26,17 @@ in_box() { local b=$1; shift
     -- bash -lc "$*" </dev/null; }
 
 usage() { cat <<'U'
+  +-------+
+  | o   o |   lxsandbox
+  |  ___  |   agents go in, the mess stays in
+  +-------+
+
 lxsandbox, alias lxs. Boxes are LXD containers where Claude Code / Codex run in bypass mode.
 
 lxs image build                     create/provision the golden container and snapshot it
 lxs image refresh-cli               copy the host's claude + codex binaries into golden
 
-lxs account claude <name>           log in once on the host (claude setup-token), reused by boxes
+lxs account claude <name>           paste a token, or Enter to run claude setup-token; reused by boxes
 lxs account codex <name>            codex login into its own CODEX_HOME, shared by boxes
 lxs account ls
 
@@ -85,9 +90,13 @@ account() {
     claude)
       local n=${2:?name} f
       f="$LXSANDBOX_HOME/accounts/claude/$n.token"
-      echo "Running 'claude setup-token': log in with the account for '$n', then paste the token below."
-      claude setup-token || true
-      read -r -p "token for $n: " tok
+      read -r -p "Paste a Claude token for '$n', or press Enter to create one with 'claude setup-token': " tok
+      if [ -z "$tok" ]; then
+        claude setup-token || true
+        echo; echo "Copy the sk-ant-... token printed above and paste it here."
+        read -r -p "token for $n: " tok
+      fi
+      tok=${tok//[[:space:]]/}
       [[ $tok == sk-ant-* ]] || die "doesn't look like a Claude token"
       ( umask 077; printf '%s\n' "$tok" > "$f" ); echo "saved $f" ;;
     codex)
