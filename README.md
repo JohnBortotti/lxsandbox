@@ -24,9 +24,9 @@ bypass mode inside disposable sandboxes on a Linux host. It's one bash script, `
     lxs image build                                   # golden container + snapshot (once)
     lxs account claude personal                       # claude setup-token, stored for boxes
     lxs account codex personal                        # codex login into its own CODEX_HOME
-    lxs env new web --claude personal --codex personal --repo owner/web-app
+    lxs env new web --repo owner/web-app
     lxs new w1 --env web --repo owner/api             # repos land in /work on branch box/w1
-    lxs run w1 claude --name main "read the repo and summarize it"
+    lxs run w1 claude --account personal --name main "read the repo and summarize it"
     lxs logs w1 main; lxs send w1 main "now run the tests"; lxs attach w1 main
 
 ## Concepts
@@ -34,7 +34,8 @@ bypass mode inside disposable sandboxes on a Linux host. It's one bash script, `
   `image/provision.sh` installs the tooling; `lxs image refresh-cli` updates claude/codex.
 - **Account** (`~/.lxsandbox/accounts/`): Claude uses a long-lived `claude setup-token` token, exported as
   `CLAUDE_CODE_OAUTH_TOKEN`. Codex uses one `CODEX_HOME` per account, mounted into boxes so token
-  refreshes are shared.
+  refreshes are shared. Accounts are not tied to envs: `lxs run --account` picks one per session, so
+  one box can run agents on different accounts (left out when only one account of that kind exists).
 - **Env** (`~/.lxsandbox/envs/<env>/`): `env.conf`, `secrets.env` (exported inside the box), `setup.sh`
   (runs after repos are cloned).
 - **Box:** repos are bundled on the host (so private repos clone with your host credentials) into

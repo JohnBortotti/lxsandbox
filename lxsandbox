@@ -66,7 +66,7 @@ lxs account claude <name>           paste a token, or Enter to run claude setup-
 lxs account codex <name>            codex login into its own CODEX_HOME, shared by boxes
 lxs account ls
 
-lxs env new <env> [--claude ACC] [--codex ACC] [--mcp HOOK[:SCOPE]] [--repo R]... [--no-github] [--egress open]
+lxs env new <env> [--mcp HOOK[:SCOPE]] [--repo R]... [--no-github] [--egress open]
 lxs env ls | show <env> | edit <env> [env.conf|secrets.env|setup.sh] | rm <env>
 
 lxs new <box> --env <env> [--repo R]...   R = a local path, ~/workspace/<dir>, owner/name or a git url
@@ -80,7 +80,9 @@ lxs egress remove <env> HOST...
 lxs egress mode <env> allowlist|open   for boxes created from now on
 lxs egress log [-n N] [--box B]     recent ALLOW/DENY decisions
 
-lxs run <box> claude|codex [--name S] [--cwd DIR] ["prompt"]   start an agent in tmux session S
+lxs run <box> claude|codex [--account ACC] [--name S] [--cwd DIR] ["prompt"]
+                                    start an agent in tmux session S, logged in as ACC
+                                    (ACC may be left out when only one account of that kind exists)
 lxs ps <box>                        agent sessions in a box
 lxs send <box> <S> "text"           type a message into a session and press Enter
 lxs logs <box> <S> [-n N]           last N lines of the session screen (default 60)
@@ -146,8 +148,7 @@ accounts_json() {
   local f k n
   for f in "$LXSANDBOX_HOME"/accounts/claude/*.token "$LXSANDBOX_HOME"/accounts/codex/*/; do
     [ -e "$f" ] || continue; k=$(basename "$(dirname "$f")"); n=$(basename "$f" .token)
-    jq -nc --arg k "$k" --arg n "$n" --argjson e "$(envs_json)" \
-      '{agent: $k, account: $n, envs: [$e[] | select((if $k == "claude" then .claude else .codex end) == $n) | .env]}'
+    jq -nc --arg k "$k" --arg n "$n" '{agent: $k, account: $n}'
   done | jq -sc .
 }
 
@@ -156,10 +157,8 @@ env_new() {
   local e=${1:?env name}; shift
   [[ $e =~ ^[a-z0-9-]+$ ]] || die "env names: a-z 0-9 -"
   local d="$LXSANDBOX_HOME/envs/$e"; [ -e "$d" ] && die "env $e exists"
-  local claude_acc="" codex_acc="" mcp="" github=host egress=allowlist repos=()
+  local mcp="" github=host egress=allowlist repos=()
   while [ $# -gt 0 ]; do case "$1" in
-    --claude) claude_acc=$2; shift 2;;
-    --codex) codex_acc=$2; shift 2;;
     --mcp) mcp=$2; shift 2;;
     --repo) repos+=("$2"); shift 2;;
     --no-github) github=off; shift;;
@@ -170,8 +169,6 @@ env_new() {
   mkdir -p "$d"; chmod 700 "$d"
   cat > "$d/env.conf" <<C
 # lxsandbox env: $e
-CLAUDE_ACCOUNT=$claude_acc    # name under accounts/claude, empty = not logged in
-CODEX_ACCOUNT=$codex_acc     # name under accounts/codex, empty = not logged in
 MCP=$mcp               # HOOK[:SCOPE]: hooks/HOOK mints a per-box MCP url + token; empty = none
 GITHUB=$github           # host = forward the host's ssh-agent + gh login into boxes; off = none
 REPOS="${repos[*]:-}"    # default repos for new boxes
@@ -189,12 +186,12 @@ envs_json() {
   local d boxes; boxes=$(boxes_json 0)
   for d in "$LXSANDBOX_HOME"/envs/*/; do [ -f "$d/env.conf" ] || continue
     ( . "$d/env.conf"; e=$(basename "$d")
-      jq -nc --arg env "$e" --arg claude "${CLAUDE_ACCOUNT:-}" --arg codex "${CODEX_ACCOUNT:-}" --arg mcp "${MCP:-}" \
+      jq -nc --arg env "$e" --arg mcp "${MCP:-}" \
         --arg github "${GITHUB:-off}" --arg egress "${EGRESS:-open}" --arg repos "${REPOS:-}" \
         --arg cpu "${CPU:-4}" --arg mem "${MEMORY:-8GiB}" --argjson boxes "$boxes" \
         --arg secrets "$(grep -c '^[A-Za-z_]' "$d/secrets.env" 2>/dev/null || true)" \
         --arg allow "$(allow_list "$d/egress.allow")" \
-        '{env: $env, claude: $claude, codex: $codex, mcp: $mcp, github: $github, egress: $egress,
+        '{env: $env, mcp: $mcp, github: $github, egress: $egress,
           allow: ($allow | split("\n") | map(select(. != ""))), repos: ($repos | split(" ") | map(select(. != ""))),
           cpu: $cpu, memory: $mem, secrets: ($secrets | tonumber? // 0),
           boxes: [$boxes[] | select(.env == $env) | .box]}' )
@@ -205,7 +202,7 @@ env_cmd() {
   case "$sub" in
     new) env_new "$@" ;;
     ls) show "$(envs_json)" "no envs (lxs env new <env>)" \
-          '{env, claude, codex, mcp, github, egress, allowed: (.allow | length), repos, boxes: (.boxes | length)}' ;;
+          '{env, mcp, github, egress, allowed: (.allow | length), repos, boxes: (.boxes | length)}' ;;
     show) need_env "${1:?env}"; show_obj "$(envs_json | jq -c --arg e "$1" '.[] | select(.env == $e)')" ;;
     edit) need_env "$1"; "${EDITOR:-vi}" "$LXSANDBOX_HOME/envs/$1/${2:-env.conf}" ;;
     rm) need_env "$1"; local used
@@ -402,10 +399,6 @@ box_new() {
   # shellcheck disable=SC1091
   . "$d/env.conf"
   lxc query "/1.0/instances/$GOLDEN/snapshots/base" >/dev/null 2>&1 || die "no golden snapshot; run: lxs image build"
-  [ -z "${CLAUDE_ACCOUNT:-}" ] || [ -f "$LXSANDBOX_HOME/accounts/claude/$CLAUDE_ACCOUNT.token" ] \
-    || die "no claude account $CLAUDE_ACCOUNT (lxs account claude $CLAUDE_ACCOUNT)"
-  [ -z "${CODEX_ACCOUNT:-}" ] || [ -d "$LXSANDBOX_HOME/accounts/codex/$CODEX_ACCOUNT" ] \
-    || die "no codex account $CODEX_ACCOUNT (lxs account codex $CODEX_ACCOUNT)"
 
   lxc copy "$GOLDEN/base" "$b" -c security.nesting=true -c security.syscalls.intercept.mknod=true \
     -c security.syscalls.intercept.setxattr=true -c limits.cpu="${CPU:-4}" -c limits.memory="${MEMORY:-8GiB}" \
@@ -415,8 +408,6 @@ box_new() {
     out=$(mcp_mint "$b" "$MCP"); mcp_url=$(jq -r .url <<<"$out"); mcp_token=$(jq -r .token <<<"$out")
     mcp_reach "$b" "$mcp_url"
   fi
-  [ -n "${CODEX_ACCOUNT:-}" ] && lxc config device add "$b" codex-auth disk \
-    source="$LXSANDBOX_HOME/accounts/codex/$CODEX_ACCOUNT" path=/mnt/codex-auth shift=true >/dev/null
   [ "${GITHUB:-off}" = host ] && github_devices "$b"
   [ "${EGRESS:-open}" = allowlist ] && egress_devices "$b" "$e"
   lxc start "$b"; wait_up "$b"
@@ -427,7 +418,6 @@ box_new() {
   {
     echo "# generated by lxsandbox for env $e"
     echo "export DISABLE_AUTOUPDATER=1 IS_SANDBOX=1"
-    [ -n "${CLAUDE_ACCOUNT:-}" ] && echo "export CLAUDE_CODE_OAUTH_TOKEN=$(q "$(cat "$LXSANDBOX_HOME/accounts/claude/$CLAUDE_ACCOUNT.token")")"
     [ -n "$mcp_token" ] && echo "export MCP_TOKEN=$(q "$mcp_token")"
     grep -E '^[A-Za-z_][A-Za-z0-9_]*=' "$d/secrets.env" | sed 's/^/export /' || true
   } > "$tmp/boxenv"
@@ -453,7 +443,6 @@ box_new() {
   lxc file push --uid 1000 --gid 1000 --mode 0600 "$tmp/claude.json" "$b/home/agent/.claude.json"
   in_box "$b" 'mkdir -p ~/.codex ~/.claude'
   lxc file push --uid 1000 --gid 1000 --mode 0600 "$tmp/codex.toml" "$b/home/agent/.codex/config.toml"
-  [ -n "${CODEX_ACCOUNT:-}" ] && in_box "$b" 'ln -sf /mnt/codex-auth/auth.json ~/.codex/auth.json'
 
   # ---- repos + setup ----
   local r; for r in ${REPOS:-} "${extra[@]}"; do [ -n "$r" ] && push_repo "$b" "$(resolve_repo "$r")"; done
@@ -543,17 +532,44 @@ box_start() {
 
 # ---------- agent sessions ----------
 agent_run() {
-  local b=${1:?box} kind=${2:?claude|codex}; shift 2; local s="" cwd=/work prompt="" cmd
-  while [ $# -gt 0 ]; do case "$1" in --name) s=$2; shift 2;; --cwd) cwd=$2; shift 2;; *) prompt=$1; shift;; esac; done
+  local b=${1:?box} kind=${2:?claude|codex}; shift 2; local s="" cwd=/work prompt="" acc="" cmd
+  while [ $# -gt 0 ]; do case "$1" in --name) s=$2; shift 2;; --cwd) cwd=$2; shift 2;; --account) acc=$2; shift 2;;
+    *) prompt=$1; shift;; esac; done
+  is_box "$b" || die "no box $b"
+  [[ $kind == claude || $kind == codex ]] || die "agent must be claude or codex"
+  acc=$(pick_account "$kind" "$acc")
   s=${s:-$kind-$(date +%H%M%S)}
+  # The account is chosen per session: its credentials go into the box only now, and only that
+  # session's environment points at them, so one box can run agents on different accounts.
   case "$kind" in
-    claude) cmd="claude --dangerously-skip-permissions" ;;
-    codex)  cmd="codex --dangerously-bypass-approvals-and-sandbox" ;;
-    *) die "agent must be claude or codex" ;;
+    claude)
+      in_box "$b" 'mkdir -p ~/.lxs/claude && chmod 700 ~/.lxs ~/.lxs/claude'
+      lxc file push --uid 1000 --gid 1000 --mode 0600 "$LXSANDBOX_HOME/accounts/claude/$acc.token" \
+        "$b/home/agent/.lxs/claude/$acc.token"
+      cmd="export CLAUDE_CODE_OAUTH_TOKEN=\$(cat ~/.lxs/claude/$acc.token); claude --dangerously-skip-permissions" ;;
+    codex)
+      # Codex refreshes auth.json itself, so the account dir is mounted (shared, not copied).
+      lxc config device get "$b" "codex-$acc" source >/dev/null 2>&1 || lxc config device add "$b" "codex-$acc" disk \
+        source="$LXSANDBOX_HOME/accounts/codex/$acc" path="/mnt/codex/$acc" shift=true >/dev/null
+      in_box "$b" "h=~/.lxs/codex/$acc; mkdir -p \$h && ln -sf ~/.codex/config.toml \$h/config.toml && ln -sf /mnt/codex/$acc/auth.json \$h/auth.json"
+      cmd="export CODEX_HOME=~/.lxs/codex/$acc; codex --dangerously-bypass-approvals-and-sandbox" ;;
   esac
   [ -n "$prompt" ] && cmd+=" $(q "$prompt")"
   in_box "$b" "tmux new-session -d -s $(q "$s") -x 220 -y 50 -c $(q "$cwd") $(q "bash -lc $(q "$cmd; exec bash")")"
   echo "$s"
+}
+pick_account() { # pick_account <claude|codex> [name] -> name, or the only one there is
+  local k=$1 n=${2:-} d="$LXSANDBOX_HOME/accounts/$1" all
+  if [ -n "$n" ]; then
+    [[ $n =~ ^[a-z0-9-]+$ ]] && { [ -f "$d/$n.token" ] || [ -d "$d/$n" ]; } || die "no $k account $n (lxs account $k $n)"
+    echo "$n"; return
+  fi
+  all=$(ls "$d" 2>/dev/null | sed 's/\.token$//')
+  case $(grep -c . <<<"$all") in
+    0) die "no $k account yet (lxs account $k <name>)" ;;
+    1) echo "$all" ;;
+    *) die "several $k accounts, pick one with --account: $(paste -sd' ' <<<"$all")" ;;
+  esac
 }
 agent_send() { local b=$1 s=$2 t=$3
   in_box "$b" "tmux send-keys -t $(q "$s") -l $(q "$t") && sleep 0.3 && tmux send-keys -t $(q "$s") Enter"; }
