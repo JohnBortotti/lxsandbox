@@ -1,0 +1,383 @@
+#!/usr/bin/env bash
+# lxsandbox (alias: lxs): a thin CLI over LXD for running coding agents (Claude Code, Codex) in sandboxes.
+#
+#   env     a named preset: accounts, MCP hook, secrets, default repos, setup script
+#   box     an LXD system container cloned from the golden snapshot, with repos in /work
+#   session an agent running in tmux inside a box, in bypass mode, as user "agent"
+set -euo pipefail
+
+LXSANDBOX_HOME=${LXSANDBOX_HOME:-$HOME/.lxsandbox}
+LXSANDBOX_IMAGE=${LXSANDBOX_IMAGE:-images:debian/trixie/cloud}
+LXSANDBOX_SSH_KEY=${LXSANDBOX_SSH_KEY:-$HOME/.ssh/id_ed25519}
+SRC=$(cd "$(dirname "$(readlink -f "$0")")" && pwd)
+GOLDEN=lxsandbox-golden
+AGENT_SOCK=$LXSANDBOX_HOME/ssh-agent.sock
+mkdir -p "$LXSANDBOX_HOME"/{envs,hooks,accounts/claude,accounts/codex}
+chmod 700 "$LXSANDBOX_HOME"
+
+die() { echo "lxs: $*" >&2; exit 1; }
+q() { printf '%q' "$1"; }
+need_env() { [ -f "$LXSANDBOX_HOME/envs/$1/env.conf" ] || die "no env '$1' (lxs env ls)"; }
+is_box() { [ -n "$(lxc config get "$1" user.lxsandbox.env 2>/dev/null)" ]; }
+wait_up() { for _ in $(seq 30); do lxc exec "$1" -- true 2>/dev/null && return; sleep 1; done; }
+# Run a command in a box as "agent" with a login shell (so ~/.boxenv is loaded).
+in_box() { local b=$1; shift
+  lxc exec "$b" --user 1000 --group 1000 --cwd /home/agent --env HOME=/home/agent --env USER=agent \
+    -- bash -lc "$*" </dev/null; }
+
+usage() { cat <<'U'
+lxsandbox, alias lxs. Boxes are LXD containers where Claude Code / Codex run in bypass mode.
+
+lxs image build                     create/provision the golden container and snapshot it
+lxs image refresh-cli               copy the host's claude + codex binaries into golden
+
+lxs account claude <name>           log in once on the host (claude setup-token), reused by boxes
+lxs account codex <name>            codex login into its own CODEX_HOME, shared by boxes
+lxs account ls
+
+lxs env new <env> [--claude ACC] [--codex ACC] [--mcp HOOK[:SCOPE]] [--repo R]... [--no-github]
+lxs env ls | show <env> | edit <env> [env.conf|secrets.env|setup.sh] | rm <env>
+
+lxs new <box> --env <env> [--repo R]...   R = a local path, ~/workspace/<dir>, or owner/name
+lxs ls | shell <box> | snap <box> [name] | stop <box> | start <box>
+lxs rm <box> [--force]              refuses if a /work repo has unpushed or uncommitted work
+lxs prune [--yes]                   list (or delete) idle boxes with nothing unsaved
+
+lxs run <box> claude|codex [--name S] [--cwd DIR] ["prompt"]   start an agent in tmux session S
+lxs ps <box>                        agent sessions in a box
+lxs send <box> <S> "text"           type a message into a session and press Enter
+lxs logs <box> <S> [-n N]           last N lines of the session screen (default 60)
+lxs attach <box> <S>                attach your terminal to a session
+lxs kill <box> <S>
+U
+}
+
+# ---------- image ----------
+image_build() {
+  if ! lxc info "$GOLDEN" >/dev/null 2>&1; then
+    lxc launch "$LXSANDBOX_IMAGE" "$GOLDEN" -c security.nesting=true \
+      -c security.syscalls.intercept.mknod=true -c security.syscalls.intercept.setxattr=true
+  fi
+  [ "$(lxc list "^$GOLDEN\$" -c s -f csv)" = RUNNING ] || lxc start "$GOLDEN"
+  wait_up "$GOLDEN"
+  lxc exec "$GOLDEN" -- cloud-init status --wait >/dev/null 2>&1 || true
+  lxc file push "$SRC/image/provision.sh" "$GOLDEN/root/provision.sh"
+  lxc exec "$GOLDEN" -- bash /root/provision.sh
+  image_refresh_cli
+  lxc stop "$GOLDEN" --timeout 60 || lxc stop -f "$GOLDEN"
+  lxc delete "$GOLDEN/base" 2>/dev/null || true
+  lxc snapshot "$GOLDEN" base
+  echo "golden ready: $GOLDEN/base"
+}
+image_refresh_cli() {
+  local claude_bin codex_bin
+  claude_bin=$(readlink -f "$(command -v claude)") || die "claude not found on host"
+  codex_bin=$(readlink -f "$(command -v codex)") || die "codex not found on host"
+  [ "$(lxc list "^$GOLDEN\$" -c s -f csv)" = RUNNING ] || { lxc start "$GOLDEN"; wait_up "$GOLDEN"; }
+  lxc file push --mode 0755 "$claude_bin" "$GOLDEN/usr/local/bin/claude"
+  lxc file push --mode 0755 "$codex_bin" "$GOLDEN/usr/local/bin/codex"
+  echo "pushed claude $(claude --version | cut -d' ' -f1), $(codex --version)"
+}
+
+# ---------- accounts ----------
+account() {
+  case "${1:-}" in
+    claude)
+      local n=${2:?name} f
+      f="$LXSANDBOX_HOME/accounts/claude/$n.token"
+      echo "Running 'claude setup-token': log in with the account for '$n', then paste the token below."
+      claude setup-token || true
+      read -r -p "token for $n: " tok
+      [[ $tok == sk-ant-* ]] || die "doesn't look like a Claude token"
+      ( umask 077; printf '%s\n' "$tok" > "$f" ); echo "saved $f" ;;
+    codex)
+      local n=${2:?name} d
+      d="$LXSANDBOX_HOME/accounts/codex/$n"
+      mkdir -p "$d"; chmod 700 "$d"
+      CODEX_HOME=$d codex login --device-auth || CODEX_HOME=$d codex login
+      [ -f "$d/auth.json" ] && echo "saved $d/auth.json" ;;
+    ls|"")
+      echo "claude:"; ls "$LXSANDBOX_HOME/accounts/claude" 2>/dev/null | sed 's/\.token$//;s/^/  /'
+      echo "codex:";  ls "$LXSANDBOX_HOME/accounts/codex" 2>/dev/null | sed 's/^/  /' ;;
+    *) die "lxs account claude|codex <name> | ls" ;;
+  esac
+}
+
+# ---------- envs ----------
+env_new() {
+  local e=${1:?env name}; shift
+  [[ $e =~ ^[a-z0-9-]+$ ]] || die "env names: a-z 0-9 -"
+  local d="$LXSANDBOX_HOME/envs/$e"; [ -e "$d" ] && die "env $e exists"
+  local claude_acc="" codex_acc="" mcp="" github=host repos=()
+  while [ $# -gt 0 ]; do case "$1" in
+    --claude) claude_acc=$2; shift 2;;
+    --codex) codex_acc=$2; shift 2;;
+    --mcp) mcp=$2; shift 2;;
+    --repo) repos+=("$2"); shift 2;;
+    --no-github) github=off; shift;;
+    *) die "unknown flag $1";; esac; done
+  [ -z "$mcp" ] || [ -x "$LXSANDBOX_HOME/hooks/${mcp%%:*}" ] || die "no MCP hook $LXSANDBOX_HOME/hooks/${mcp%%:*} (see examples/)"
+  mkdir -p "$d"; chmod 700 "$d"
+  cat > "$d/env.conf" <<C
+# lxsandbox env: $e
+CLAUDE_ACCOUNT=$claude_acc    # name under accounts/claude, empty = not logged in
+CODEX_ACCOUNT=$codex_acc     # name under accounts/codex, empty = not logged in
+MCP=$mcp               # HOOK[:SCOPE]: hooks/HOOK mints a per-box MCP url + token; empty = none
+GITHUB=$github           # host = forward the host's ssh-agent + gh login into boxes; off = none
+REPOS="${repos[*]:-}"    # default repos for new boxes
+CPU=4
+MEMORY=8GiB
+C
+  ( umask 077; printf '# KEY=value lines, exported inside the box\n' > "$d/secrets.env" )
+  printf '#!/usr/bin/env bash\n# runs as agent inside the box after repos are cloned (cwd /work)\n' > "$d/setup.sh"
+  echo "env $e created: $d"
+}
+env_cmd() {
+  local sub=${1:-ls}; shift || true
+  case "$sub" in
+    new) env_new "$@" ;;
+    ls) for d in "$LXSANDBOX_HOME"/envs/*/; do [ -d "$d" ] || continue
+          ( . "$d/env.conf"; printf '%-16s claude=%-10s codex=%-10s mcp=%-14s github=%-5s repos=%s\n' "$(basename "$d")" \
+              "${CLAUDE_ACCOUNT:--}" "${CODEX_ACCOUNT:--}" "${MCP:--}" "${GITHUB:-off}" "${REPOS:--}" ); done ;;
+    show) need_env "$1"; cat "$LXSANDBOX_HOME/envs/$1/env.conf"
+          echo "secrets: $(grep -c '^[A-Za-z_]' "$LXSANDBOX_HOME/envs/$1/secrets.env" || true) keys" ;;
+    edit) need_env "$1"; "${EDITOR:-vi}" "$LXSANDBOX_HOME/envs/$1/${2:-env.conf}" ;;
+    rm) need_env "$1"; local used
+        used=$(lxc list -f csv -c n | while read -r n; do
+                 if [ "$(lxc config get "$n" user.lxsandbox.env 2>/dev/null)" = "$1" ]; then echo "$n"; fi; done | paste -sd' ' -)
+        [ -z "$used" ] || die "env $1 still used by: $used (lxs rm them first)"
+        rm -rf "${LXSANDBOX_HOME:?}/envs/$1"; echo "removed env $1" ;;
+    *) die "lxs env new|ls|show|edit|rm" ;;
+  esac
+}
+
+# ---------- repos ----------
+resolve_repo() { # print a local git dir for R; owner/name is cloned on the host into a temp dir
+  local r=$1
+  if [ -d "$r/.git" ]; then readlink -f "$r"
+  elif [ -d "$HOME/workspace/$r/.git" ]; then echo "$HOME/workspace/$r"
+  elif [[ $r == */* ]]; then local t; t=$(mktemp -d); gh repo clone "$r" "$t/$(basename "$r")" -- -q >&2; echo "$t/$(basename "$r")"
+  else die "repo not found: $r"; fi
+}
+push_repo() { # bundle all refs of a host repo, clone it into /work/<name> on a new branch box/<box>
+  local b=$1 src=$2 name origin bundle head host ip
+  name=$(basename "$src"); origin=$(git -C "$src" remote get-url origin 2>/dev/null || true)
+  bundle=$(mktemp --suffix .bundle); git -C "$src" bundle create "$bundle" --all 2>/dev/null
+  lxc file push "$bundle" "$b/tmp/$name.bundle"; rm -f "$bundle"
+  head=$(git -C "$src" symbolic-ref --short HEAD 2>/dev/null || echo main)
+  in_box "$b" "cd /work && git -c init.defaultBranch=main clone -q /tmp/$(q "$name").bundle $(q "$name") && cd $(q "$name") \
+    && { git checkout -q $(q "$head") 2>/dev/null || true; } && git checkout -q -b box/$(q "$b") \
+    && ${origin:+git remote set-url origin $(q "$origin") &&} rm -f /tmp/$(q "$name").bundle"
+  # A dotless origin host only resolves on the host (e.g. tailnet MagicDNS): pin it in the box.
+  host=$(sed -E 's#^[a-z+]+://##; s#^[^@/]*@##; s#[:/].*$##' <<<"$origin")
+  if [ -n "$host" ] && [[ $host != *.* ]]; then
+    ip=$(getent hosts "$host" | awk '{print $1; exit}')
+    [ -n "$ip" ] && lxc exec "$b" -- sh -c "grep -q ' $host\$' /etc/hosts || echo '$ip $host' >> /etc/hosts"
+  fi
+  echo "  repo $name ($head → box/$b)"
+}
+
+# ---------- github: the host's identity, forwarded in (the private key never enters a box) ----------
+ensure_agent() { # a dedicated ssh-agent for boxes, holding the host key
+  SSH_AUTH_SOCK=$AGENT_SOCK ssh-add -l >/dev/null 2>&1 && return
+  rm -f "$AGENT_SOCK"; ssh-agent -a "$AGENT_SOCK" >/dev/null
+  SSH_AUTH_SOCK=$AGENT_SOCK ssh-add -q "$LXSANDBOX_SSH_KEY"
+}
+github_devices() {
+  local b=$1; ensure_agent
+  lxc config device add "$b" ssh-agent proxy bind=instance connect="unix:$AGENT_SOCK" \
+    listen=unix:/home/agent/.ssh-agent.sock uid=1000 gid=1000 mode=0600 >/dev/null
+  [ -d "$HOME/.config/gh" ] && lxc config device add "$b" gh disk source="$HOME/.config/gh" \
+    path=/home/agent/.config/gh readonly=true shift=true >/dev/null
+  return 0
+}
+github_config() {
+  local b=$1 tmp=$2
+  echo "export SSH_AUTH_SOCK=/home/agent/.ssh-agent.sock" >> "$tmp/boxenv"
+  in_box "$b" 'mkdir -p ~/.ssh && chmod 700 ~/.ssh'
+  [ -f "$HOME/.ssh/known_hosts" ] && lxc file push --uid 1000 --gid 1000 --mode 0600 "$HOME/.ssh/known_hosts" "$b/home/agent/.ssh/known_hosts"
+  printf 'IgnoreUnknown *\nHost *\n  StrictHostKeyChecking accept-new\n' > "$tmp/sshconfig"
+  [ -f "$HOME/.ssh/config" ] && cat "$HOME/.ssh/config" >> "$tmp/sshconfig"
+  lxc file push --uid 1000 --gid 1000 --mode 0600 "$tmp/sshconfig" "$b/home/agent/.ssh/config"
+  in_box "$b" "git config --global user.name $(q "$(git config --global user.name)") && \
+    git config --global user.email $(q "$(git config --global user.email)") && gh auth setup-git >/dev/null 2>&1 || true"
+}
+
+# ---------- mcp: hooks/<HOOK> mint <box> <scope> → {"url","token"}; hooks/<HOOK> revoke <box> ----------
+mcp_mint() {
+  local b=$1 hook=${2%%:*} scope=${2#*:} out
+  [ "$scope" = "$2" ] && scope=""
+  out=$("$LXSANDBOX_HOME/hooks/$hook" mint "$b" "$scope") || die "MCP hook $hook failed to mint"
+  jq -e '.url and .token' <<<"$out" >/dev/null || die "MCP hook $hook must print {\"url\":…,\"token\":…}"
+  lxc config set "$b" user.lxsandbox.mcp="$hook"
+  echo "$out"
+}
+mcp_revoke() {
+  local b=$1 hook; hook=$(lxc config get "$b" user.lxsandbox.mcp 2>/dev/null || true)
+  [ -n "$hook" ] && [ -x "$LXSANDBOX_HOME/hooks/$hook" ] && "$LXSANDBOX_HOME/hooks/$hook" revoke "$b" >/dev/null 2>&1
+  return 0
+}
+mcp_reach() { # a localhost MCP url on the host stays localhost inside the box, via an LXD proxy device
+  local b=$1 url=$2 port
+  [[ $url =~ ^https?://(127\.0\.0\.1|localhost):([0-9]+) ]] || return 0
+  port=${BASH_REMATCH[2]}
+  lxc config device add "$b" mcp proxy listen=tcp:127.0.0.1:$port connect=tcp:127.0.0.1:$port bind=instance >/dev/null
+}
+
+# ---------- boxes ----------
+box_new() {
+  local b=${1:?box name}; shift; local e="" extra=()
+  [[ $b =~ ^[a-z][a-z0-9-]*$ ]] || die "box names: start with a letter, a-z 0-9 -"
+  while [ $# -gt 0 ]; do case "$1" in
+    --env) e=$2; shift 2;; --repo) extra+=("$2"); shift 2;; *) die "unknown flag $1";; esac; done
+  [ -n "$e" ] || die "--env required"; need_env "$e"
+  local d="$LXSANDBOX_HOME/envs/$e"
+  # shellcheck disable=SC1091
+  . "$d/env.conf"
+  lxc query "/1.0/instances/$GOLDEN/snapshots/base" >/dev/null 2>&1 || die "no golden snapshot; run: lxs image build"
+  [ -z "${CLAUDE_ACCOUNT:-}" ] || [ -f "$LXSANDBOX_HOME/accounts/claude/$CLAUDE_ACCOUNT.token" ] \
+    || die "no claude account $CLAUDE_ACCOUNT (lxs account claude $CLAUDE_ACCOUNT)"
+  [ -z "${CODEX_ACCOUNT:-}" ] || [ -d "$LXSANDBOX_HOME/accounts/codex/$CODEX_ACCOUNT" ] \
+    || die "no codex account $CODEX_ACCOUNT (lxs account codex $CODEX_ACCOUNT)"
+
+  lxc copy "$GOLDEN/base" "$b" -c security.nesting=true -c security.syscalls.intercept.mknod=true \
+    -c security.syscalls.intercept.setxattr=true -c limits.cpu="${CPU:-4}" -c limits.memory="${MEMORY:-8GiB}" \
+    -c user.lxsandbox.env="$e"
+  local mcp_url="" mcp_token="" out
+  if [ -n "${MCP:-}" ]; then
+    out=$(mcp_mint "$b" "$MCP"); mcp_url=$(jq -r .url <<<"$out"); mcp_token=$(jq -r .token <<<"$out")
+    mcp_reach "$b" "$mcp_url"
+  fi
+  [ -n "${CODEX_ACCOUNT:-}" ] && lxc config device add "$b" codex-auth disk \
+    source="$LXSANDBOX_HOME/accounts/codex/$CODEX_ACCOUNT" path=/mnt/codex-auth shift=true >/dev/null
+  [ "${GITHUB:-off}" = host ] && github_devices "$b"
+  lxc start "$b"; wait_up "$b"
+
+  # ---- agent config, built on the host and pushed in ----
+  local tmp mcp_name=${MCP%%:*}; tmp=$(mktemp -d); trap 'rm -rf "$tmp"' RETURN
+  {
+    echo "# generated by lxsandbox for env $e"
+    echo "export DISABLE_AUTOUPDATER=1 IS_SANDBOX=1"
+    [ -n "${CLAUDE_ACCOUNT:-}" ] && echo "export CLAUDE_CODE_OAUTH_TOKEN=$(q "$(cat "$LXSANDBOX_HOME/accounts/claude/$CLAUDE_ACCOUNT.token")")"
+    [ -n "$mcp_token" ] && echo "export MCP_TOKEN=$(q "$mcp_token")"
+    grep -E '^[A-Za-z_][A-Za-z0-9_]*=' "$d/secrets.env" | sed 's/^/export /' || true
+  } > "$tmp/boxenv"
+  [ "${GITHUB:-off}" = host ] && github_config "$b" "$tmp"
+  jq -n --arg name "$mcp_name" --arg url "$mcp_url" --arg tok "$mcp_token" '{
+      hasCompletedOnboarding: true, bypassPermissionsModeAccepted: true,
+      projects: {"/work": {hasTrustDialogAccepted: true}},
+      mcpServers: (if $url == "" then {} else {($name): {type: "http", url: $url, headers: {Authorization: ("Bearer " + $tok)}}} end)
+    }' > "$tmp/claude.json"
+  {
+    echo 'approval_policy = "never"'
+    echo 'sandbox_mode = "danger-full-access"'
+    echo '[projects."/work"]'; echo 'trust_level = "trusted"'
+    if [ -n "$mcp_url" ]; then
+      echo "[mcp_servers.$mcp_name]"; echo "url = \"$mcp_url\""; echo 'bearer_token_env_var = "MCP_TOKEN"'
+    fi
+  } > "$tmp/codex.toml"
+  lxc file push --uid 1000 --gid 1000 --mode 0600 "$tmp/boxenv" "$b/home/agent/.boxenv"
+  lxc file push --uid 1000 --gid 1000 --mode 0600 "$tmp/claude.json" "$b/home/agent/.claude.json"
+  in_box "$b" 'mkdir -p ~/.codex ~/.claude'
+  lxc file push --uid 1000 --gid 1000 --mode 0600 "$tmp/codex.toml" "$b/home/agent/.codex/config.toml"
+  [ -n "${CODEX_ACCOUNT:-}" ] && in_box "$b" 'ln -sf /mnt/codex-auth/auth.json ~/.codex/auth.json'
+
+  # ---- repos + setup ----
+  local r; for r in ${REPOS:-} "${extra[@]}"; do [ -n "$r" ] && push_repo "$b" "$(resolve_repo "$r")"; done
+  if grep -qv '^#' "$d/setup.sh" 2>/dev/null; then
+    lxc file push --uid 1000 --gid 1000 --mode 0700 "$d/setup.sh" "$b/home/agent/.box-setup.sh"
+    in_box "$b" 'cd /work && ~/.box-setup.sh'
+  fi
+  echo "box $b ready (env $e). Next: lxs run $b claude \"...\""
+}
+
+box_ls() {
+  printf '%-18s %-8s %-14s %s\n' BOX STATE ENV SESSIONS
+  lxc list -f csv -c n,s | while IFS=, read -r n s; do
+    local e ss="-"; e=$(lxc config get "$n" user.lxsandbox.env 2>/dev/null); [ -n "$e" ] || continue
+    [ "$s" = RUNNING ] && ss=$(in_box "$n" "tmux ls -F '#S' 2>/dev/null || true" | paste -sd, -)
+    printf '%-18s %-8s %-14s %s\n' "$n" "$s" "$e" "${ss:--}"
+  done
+}
+
+# ---------- deleting: never lose unpushed work by accident ----------
+box_dirty() { # report unsaved work in /work/*; empty output = safe to delete
+  in_box "$1" 'for r in /work/*/; do [ -d "$r/.git" ] || continue; cd "$r"
+    d=$(git status --porcelain | wc -l); u=$(git log --branches --not --remotes --oneline | wc -l)
+    [ "$d$u" = 00 ] || echo "  $(basename "$r"): $u unpushed commit(s), $d uncommitted file(s)"; done' 2>/dev/null
+}
+with_running() { # run "$@" with box $1 running, starting it temporarily if it was stopped
+  local b=$1; shift; local was rc=0; was=$(lxc list "^$b\$" -c s -f csv)
+  [ "$was" = RUNNING ] || { lxc start "$b"; wait_up "$b"; }
+  "$@" || rc=$?
+  [ "$was" = RUNNING ] || lxc stop "$b" --timeout 30 >/dev/null 2>&1 || lxc stop -f "$b"
+  return $rc
+}
+box_delete() { mcp_revoke "$1"; lxc delete -f "$1"; }
+box_rm() {
+  local b=${1:?box} force=${2:-} rep
+  is_box "$b" || die "$b is not a box"
+  if [ "$force" != --force ]; then
+    rep=$(with_running "$b" box_dirty "$b")
+    [ -z "$rep" ] || { echo "box $b has unsaved work:"; echo "$rep"; die "push it, or: lxs rm $b --force"; }
+  fi
+  box_delete "$b"; echo "removed $b"
+}
+box_prune() {
+  local yes=${1:-} n s found=0
+  while IFS=, read -r n s <&3; do
+    is_box "$n" || continue
+    [ "$s" = RUNNING ] && [ "$(in_box "$n" "tmux ls 2>/dev/null | wc -l")" != 0 ] && continue
+    [ -z "$(with_running "$n" box_dirty "$n")" ] || { echo "keep $n (unsaved work)"; continue; }
+    found=1
+    if [ "$yes" = --yes ]; then box_delete "$n"; echo "pruned $n"; else echo "would prune $n ($s)"; fi
+  done 3< <(lxc list -f csv -c n,s)
+  [ "$found" = 1 ] && [ "$yes" != --yes ] && echo "run: lxs prune --yes"
+  return 0
+}
+box_start() {
+  lxc config device get "${1:?box}" ssh-agent connect >/dev/null 2>&1 && ensure_agent
+  lxc start "$1"
+}
+
+# ---------- agent sessions ----------
+agent_run() {
+  local b=${1:?box} kind=${2:?claude|codex}; shift 2; local s="" cwd=/work prompt="" cmd
+  while [ $# -gt 0 ]; do case "$1" in --name) s=$2; shift 2;; --cwd) cwd=$2; shift 2;; *) prompt=$1; shift;; esac; done
+  s=${s:-$kind-$(date +%H%M%S)}
+  case "$kind" in
+    claude) cmd="claude --dangerously-skip-permissions" ;;
+    codex)  cmd="codex --dangerously-bypass-approvals-and-sandbox" ;;
+    *) die "agent must be claude or codex" ;;
+  esac
+  [ -n "$prompt" ] && cmd+=" $(q "$prompt")"
+  in_box "$b" "tmux new-session -d -s $(q "$s") -x 220 -y 50 -c $(q "$cwd") $(q "bash -lc $(q "$cmd; exec bash")")"
+  echo "$s"
+}
+agent_send() { local b=$1 s=$2 t=$3
+  in_box "$b" "tmux send-keys -t $(q "$s") -l $(q "$t") && sleep 0.3 && tmux send-keys -t $(q "$s") Enter"; }
+agent_logs() { local b=$1 s=$2 n=60; [ "${3:-}" = -n ] && n=$4
+  in_box "$b" "tmux capture-pane -p -t $(q "$s") -S -$n"; }
+
+cmd=${1:-help}; shift || true
+case "$cmd" in
+  image) case "${1:-}" in build) image_build;; refresh-cli) image_refresh_cli;; *) die "lxs image build|refresh-cli";; esac ;;
+  account) account "$@" ;;
+  env) env_cmd "$@" ;;
+  new) box_new "$@" ;;
+  ls) box_ls ;;
+  rm) box_rm "$@" ;;
+  prune) box_prune "$@" ;;
+  stop) lxc stop "${1:?box}" ;;
+  start) box_start "$@" ;;
+  shell) lxc exec "${1:?box}" -- sudo -iu agent ;;
+  snap) lxc snapshot "${1:?box}" ${2:+"$2"} ;;
+  run) agent_run "$@" ;;
+  ps) in_box "${1:?box}" 'tmux ls 2>/dev/null || echo "(no sessions)"' ;;
+  send) agent_send "${1:?box}" "${2:?session}" "${3:?text}" ;;
+  logs) agent_logs "$@" ;;
+  attach) lxc exec "${1:?box}" -t -- sudo -iu agent tmux attach -t "${2:?session}" ;;
+  kill) in_box "${1:?box}" "tmux kill-session -t $(q "${2:?session}")" ;;
+  help|-h|--help) usage ;;
+  *) usage; exit 1 ;;
+esac

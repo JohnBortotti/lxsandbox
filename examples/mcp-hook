@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+# Example MCP hook. Copy to ~/.lxsandbox/hooks/<name>, make it executable, then: lxs env new dev --mcp <name>[:scope]
+#
+#   <hook> mint <box> <scope>   print {"url": "...", "token": "..."} for a credential scoped to this box
+#   <hook> revoke <box>         invalidate that credential (called by lxs rm / lxs prune)
+#
+# Boxes get the server as MCP "<name>" in Claude Code and Codex, with "Authorization: Bearer <token>".
+# A url on 127.0.0.1/localhost is forwarded into the box on the same port.
+set -euo pipefail
+case "$1" in
+  mint)   jq -n --arg url "http://127.0.0.1:8080/mcp" --arg token "replace-me" '{url: $url, token: $token}' ;;
+  revoke) : ;;
+  *) echo "usage: $0 mint <box> <scope> | revoke <box>" >&2; exit 1 ;;
+esac
