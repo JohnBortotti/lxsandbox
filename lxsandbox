@@ -55,9 +55,10 @@ table() { # TSV with a header row on stdin -> aligned columns, docker/kubectl st
 }
 wait_up() { for _ in $(seq 30); do lxc exec "$1" -- true 2>/dev/null && return; sleep 1; done; }
 # Run a command in a box as "agent" with a login shell (so ~/.boxenv is loaded).
+# setpriv --init-groups: `lxc exec --user` drops supplementary groups, so docker and sudo didn't work.
 in_box() { local b=$1; shift
-  lxc exec "$b" --user 1000 --group 1000 --cwd /home/agent --env HOME=/home/agent --env USER=agent \
-    -- bash -lc "$*" </dev/null; }
+  lxc exec "$b" --cwd /home/agent --env HOME=/home/agent --env USER=agent \
+    -- setpriv --reuid=1000 --regid=1000 --init-groups bash -lc "$*" </dev/null; }
 
 usage() { cat <<'U'
 lxs status                          overview: golden image, egress proxy, accounts, envs, boxes
