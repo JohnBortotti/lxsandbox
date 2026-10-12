@@ -34,20 +34,21 @@ show_obj() { # show_obj <json object>: one KEY / VALUE row per field
   if [ "$JSON" = 1 ]; then jq . <<<"$1"; return; fi
   show "$(jq -c 'to_entries | map({key, value})' <<<"$1")"
 }
-table() { # TSV with a header row on stdin -> box-drawn table; colors only on a terminal
-  awk -F'\t' -v color="$([ -t 1 ] && echo 1)" '
+table() { # TSV with a header row on stdin -> aligned columns, docker/kubectl style; colors only on a terminal
+  local tty=""; [ -t 1 ] && tty=1
+  awk -F'\t' -v color="$tty" '
     { for (i = 1; i <= NF; i++) { c[NR, i] = $i; if (length($i) > w[i]) w[i] = length($i) }
       if (NF > nf) nf = NF; n = NR }
-    function rule(l, m, r,   s, i, j) { s = l; for (i = 1; i <= nf; i++) { for (j = 0; j < w[i] + 2; j++) s = s "─"; s = s (i < nf ? m : r) }; print s }
     function paint(p, v, h) {
       if (!color) return p
       if (h) return "\033[1m" p "\033[0m"
-      if (v ~ /^(RUNNING|allowlist|ALLOW|up)$/) return "\033[32m" p "\033[0m"
-      if (v ~ /^(open|DENY|down)$/) return "\033[33m" p "\033[0m"
+      if (v ~ /^(RUNNING|allowlist|ALLOW|up|ready)$/) return "\033[32m" p "\033[0m"
+      if (v ~ /^(open|DENY|down|missing)$/) return "\033[33m" p "\033[0m"
       if (v ~ /^(STOPPED|-)$/) return "\033[2m" p "\033[0m"
       return p }
-    function row(r,   s, i) { s = "│"; for (i = 1; i <= nf; i++) s = s " " paint(sprintf("%-" w[i] "s", c[r, i]), c[r, i], r == 1) " │"; print s }
-    END { rule("┌", "┬", "┐"); row(1); rule("├", "┼", "┤"); for (r = 2; r <= n; r++) row(r); rule("└", "┴", "┘") }'
+    END { for (r = 1; r <= n; r++) { s = ""
+            for (i = 1; i <= nf; i++) s = s paint(i < nf ? sprintf("%-" w[i] "s", c[r, i]) : c[r, i], c[r, i], r == 1) (i < nf ? "   " : "")
+            print s } }'
 }
 wait_up() { for _ in $(seq 30); do lxc exec "$1" -- true 2>/dev/null && return; sleep 1; done; }
 # Run a command in a box as "agent" with a login shell (so ~/.boxenv is loaded).
@@ -483,10 +484,12 @@ status() {
       --argjson accounts "$(accounts_json)" '{golden: $golden, egress_proxy: $proxy, accounts: $accounts, envs: $envs, boxes: $boxes}'
     return
   fi
-  echo "golden image: $golden · egress proxy: $up"
-  echo; echo "accounts"; account ls
-  echo; echo "envs"; env_cmd ls
-  echo; echo "boxes"; box_ls
+  local h=""; [ -t 1 ] && h=1
+  title() { if [ -n "$h" ]; then printf '\n\033[1;4m%s\033[0m\n' "$1"; else printf '\n%s\n' "$1"; fi; }
+  printf 'golden image %s · egress proxy %s\n' "$golden" "$up"
+  title Accounts; account ls
+  title Envs; env_cmd ls
+  title Boxes; box_ls
 }
 
 # ---------- deleting: never lose unpushed work by accident ----------
