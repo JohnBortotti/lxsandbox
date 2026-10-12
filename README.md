@@ -6,7 +6,7 @@ bypass mode inside disposable sandboxes on a Linux host. It's one bash script, `
 - **Fast:** boxes are LXD system containers cloned from a golden snapshot (a few seconds on btrfs).
 - **Batteries included:** git, gh, Node/pnpm, Python/uv, build tools, Chromium, nested Docker, tmux.
 - **Log in once:** Claude and Codex accounts are set up on the host and reused by every box.
-- **Envs:** named presets (accounts, MCP server, secrets, default repos, setup script).
+- **Envs:** named presets (MCP server, network allowlist, GitHub access, secrets, setup script); repos and accounts are picked per box and per session.
 - **Many repos and many agents per box:** each agent runs in its own tmux session you can drive from scripts.
 - **Safe deletes:** `lxs rm` refuses while any repo in the box has unpushed work.
 - **Network allowlist per env:** boxes reach only the hosts their env allows, editable live.
@@ -24,7 +24,7 @@ bypass mode inside disposable sandboxes on a Linux host. It's one bash script, `
     lxs image build                                   # golden container + snapshot (once)
     lxs account claude personal                       # claude setup-token, stored for boxes
     lxs account codex personal                        # codex login into its own CODEX_HOME
-    lxs env new web --repo owner/web-app
+    lxs env new web --mcp executor:web
     lxs new w1 --env web --repo owner/api             # repos land in /work on branch box/w1
     lxs run w1 claude --account personal --name main "read the repo and summarize it"
     lxs logs w1 main; lxs send w1 main "now run the tests"; lxs attach w1 main
@@ -40,7 +40,7 @@ bypass mode inside disposable sandboxes on a Linux host. It's one bash script, `
   (runs after repos are cloned).
 - **Box:** repos are bundled on the host (so private repos clone with your host credentials) into
   `/work/<repo>` on branch `box/<box>`, with `origin` pointing at the original remote.
-- **Repo specs** (`--repo R`, and `REPOS` in env.conf):
+- **Repo specs** (`lxs new --repo R`, repeatable):
   - `owner/name` → cloned fresh from GitHub with `gh`; a git url (`ssh://…`, `git@host:…`, `https://…`) →
     cloned fresh with `git`. Both always start from the remote's latest state.
   - a path, or a bare name found in `~/workspace/<name>` → your local checkout as it is, including

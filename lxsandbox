@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # lxsandbox (alias: lxs): a thin CLI over LXD for running coding agents (Claude Code, Codex) in sandboxes.
 #
-#   env     a named preset: accounts, MCP hook, secrets, default repos, setup script
+#   env     a named preset: MCP hook, network, GitHub access, secrets, setup script
 #   box     an LXD system container cloned from the golden snapshot, with repos in /work
 #   session an agent running in tmux inside a box, in bypass mode, as user "agent"
 set -euo pipefail
@@ -32,7 +32,10 @@ show() { # show <json array> [empty message] [jq projection of each row for the 
 }
 show_obj() { # show_obj <json object>: one KEY / VALUE row per field
   if [ "$JSON" = 1 ]; then jq . <<<"$1"; return; fi
-  show "$(jq -c 'to_entries | map({key, value})' <<<"$1")"
+  # arrays get one row per item, the key only on the first
+  show "$(jq -c '[to_entries[] | if (.value | type) == "array" and (.value | length) > 0
+    then (.key as $k | .value | to_entries[] | {key: (if .key == 0 then $k else " " end), value: .value})
+    else {key, value} end]' <<<"$1")"
 }
 table() { # TSV with a header row on stdin -> aligned columns, docker/kubectl style; colors only on a terminal
   local tty=""; [ -t 1 ] && tty=1
@@ -67,7 +70,7 @@ lxs account claude <name>           paste a token, or Enter to run claude setup-
 lxs account codex <name>            codex login into its own CODEX_HOME, shared by boxes
 lxs account ls
 
-lxs env new <env> [--mcp HOOK[:SCOPE]] [--repo R]... [--no-github] [--egress open]
+lxs env new <env> [--mcp HOOK[:SCOPE]] [--no-github] [--egress open]
 lxs env ls | show <env> | edit <env> [env.conf|secrets.env|setup.sh] | rm <env>
 
 lxs new <box> --env <env> [--repo R]...   R = a local path, ~/workspace/<dir>, owner/name or a git url
@@ -158,10 +161,9 @@ env_new() {
   local e=${1:?env name}; shift
   [[ $e =~ ^[a-z0-9-]+$ ]] || die "env names: a-z 0-9 -"
   local d="$LXSANDBOX_HOME/envs/$e"; [ -e "$d" ] && die "env $e exists"
-  local mcp="" github=host egress=allowlist repos=()
+  local mcp="" github=host egress=allowlist
   while [ $# -gt 0 ]; do case "$1" in
     --mcp) mcp=$2; shift 2;;
-    --repo) repos+=("$2"); shift 2;;
     --no-github) github=off; shift;;
     --egress) egress=$2; shift 2;;
     *) die "unknown flag $1";; esac; done
@@ -172,7 +174,6 @@ env_new() {
 # lxsandbox env: $e
 MCP=$mcp               # HOOK[:SCOPE]: hooks/HOOK mints a per-box MCP url + token; empty = none
 GITHUB=$github           # host = forward the host's ssh-agent + gh login into boxes; off = none
-REPOS="${repos[*]:-}"    # default repos for new boxes
 EGRESS=$egress   # allowlist = only hosts in egress.allow (lxs egress ...); open = unrestricted
 CPU=4
 MEMORY=8GiB
@@ -188,12 +189,12 @@ envs_json() {
   for d in "$LXSANDBOX_HOME"/envs/*/; do [ -f "$d/env.conf" ] || continue
     ( . "$d/env.conf"; e=$(basename "$d")
       jq -nc --arg env "$e" --arg mcp "${MCP:-}" \
-        --arg github "${GITHUB:-off}" --arg egress "${EGRESS:-open}" --arg repos "${REPOS:-}" \
+        --arg github "${GITHUB:-off}" --arg egress "${EGRESS:-open}" \
         --arg cpu "${CPU:-4}" --arg mem "${MEMORY:-8GiB}" --argjson boxes "$boxes" \
         --arg secrets "$(grep -c '^[A-Za-z_]' "$d/secrets.env" 2>/dev/null || true)" \
         --arg allow "$(allow_list "$d/egress.allow")" \
         '{env: $env, mcp: $mcp, github: $github, egress: $egress,
-          allow: ($allow | split("\n") | map(select(. != ""))), repos: ($repos | split(" ") | map(select(. != ""))),
+          allow: ($allow | split("\n") | map(select(. != ""))),
           cpu: $cpu, memory: $mem, secrets: ($secrets | tonumber? // 0),
           boxes: [$boxes[] | select(.env == $env) | .box]}' )
   done | jq -sc .
@@ -203,7 +204,7 @@ env_cmd() {
   case "$sub" in
     new) env_new "$@" ;;
     ls) show "$(envs_json)" "no envs (lxs env new <env>)" \
-          '{env, mcp, github, egress, allowed: (.allow | length), repos, boxes: (.boxes | length)}' ;;
+          '{env, mcp, github, egress, allowed: (.allow | length), boxes: (.boxes | length)}' ;;
     show) need_env "${1:?env}"; show_obj "$(envs_json | jq -c --arg e "$1" '.[] | select(.env == $e)')" ;;
     edit) need_env "$1"; "${EDITOR:-vi}" "$LXSANDBOX_HOME/envs/$1/${2:-env.conf}" ;;
     rm) need_env "$1"; local used
@@ -446,7 +447,7 @@ box_new() {
   lxc file push --uid 1000 --gid 1000 --mode 0600 "$tmp/codex.toml" "$b/home/agent/.codex/config.toml"
 
   # ---- repos + setup ----
-  local r; for r in ${REPOS:-} "${extra[@]}"; do [ -n "$r" ] && push_repo "$b" "$(resolve_repo "$r")"; done
+  local r; for r in ${extra[@]+"${extra[@]}"}; do [ -n "$r" ] && push_repo "$b" "$(resolve_repo "$r")"; done
   # Claude trusts folders by exact path, so mark every repo as trusted too.
   in_box "$b" 'f=~/.claude.json; for d in /work/*/; do d=${d%/}; jq --arg d "$d" ".projects[\$d].hasTrustDialogAccepted = true" "$f" > "$f.tmp" && mv "$f.tmp" "$f"; done; chmod 600 "$f"'
   if grep -qv '^#' "$d/setup.sh" 2>/dev/null; then
