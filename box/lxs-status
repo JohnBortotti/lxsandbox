@@ -1,0 +1,47 @@
+#!/usr/bin/env bash
+# Runs inside a box. Tracks what each agent session is doing, for `lxs wait` and `lxs ps` on the host.
+#   lxs-status hook working|idle|waiting|exited   Claude Code hook (event JSON on stdin)
+#   lxs-status get <session>                      print the session's status JSON
+#   lxs-status wait <session> <timeout-seconds>   block while the session is working, then print its status
+# A session's state lives in ~/.lxs/status/<session>; the session name comes from $LXS_SESSION,
+# which `lxs run` sets for the agent it starts.
+set -u
+dir=~/.lxs/status
+
+get() {
+  local f="$dir/$1" st
+  if ! tmux has-session -t "=$1" 2>/dev/null; then st=exited
+  elif [ -f "$f" ]; then jq -c --arg s "$1" '. + {session: $s}' "$f"; return
+  else st=unknown; fi
+  jq -nc --arg s "$1" --arg st "$st" '{session: $s, state: $st, since: null, message: ""}'
+}
+
+case "${1:-}" in
+  hook)
+    s=${LXS_SESSION:-}; [ -n "$s" ] || exit 0
+    in=$(cat); state=$2; msg=""
+    case "$state" in
+      idle)    # the turn ended: keep its last reply so the caller doesn't have to scrape the screen
+        msg=$(jq -r '.last_assistant_message // empty' <<<"$in")
+        t=$(jq -r '.transcript_path // empty' <<<"$in") # older Claude Code: read it from the transcript
+        [ -z "$msg" ] && [ -f "$t" ] && msg=$(tac "$t" | jq -rn 'first(inputs | select(.type == "assistant")
+          | [.message.content[]? | select(.type == "text") | .text] | join("\n") | select(length > 0))' 2>/dev/null) ;;
+      waiting) # idle_prompt only repeats that the turn ended; anything else (a permission, a question) needs an answer
+        [ "$(jq -r '.notification_type // empty' <<<"$in")" = idle_prompt ] && exit 0
+        msg=$(jq -r '.message // empty' <<<"$in") ;;
+    esac
+    mkdir -p "$dir"
+    jq -n --arg st "$state" --arg m "${msg:0:4000}" --argjson t "$(date +%s)" \
+      '{state: $st, since: $t, message: $m}' > "$dir/$s.tmp" && mv "$dir/$s.tmp" "$dir/$s" ;;
+  get) get "$2" ;;
+  wait)
+    end=$((SECONDS + $3))
+    while :; do
+      out=$(get "$2"); st=$(jq -r .state <<<"$out")
+      [ "$st" = working ] || break
+      [ "$SECONDS" -lt "$end" ] || { jq -c '.state = "timeout"' <<<"$out"; exit 0; }
+      sleep 2
+    done
+    echo "$out" ;;
+  *) echo "usage: lxs-status hook STATE | get SESSION | wait SESSION SECONDS" >&2; exit 2 ;;
+esac

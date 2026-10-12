@@ -45,9 +45,9 @@ table() { # TSV with a header row on stdin -> aligned columns, docker/kubectl st
     function paint(p, v, h) {
       if (!color) return p
       if (h) return "\033[1m" p "\033[0m"
-      if (v ~ /^(RUNNING|allowlist|ALLOW|up|ready)$/) return "\033[32m" p "\033[0m"
-      if (v ~ /^(open|DENY|down|missing)$/) return "\033[33m" p "\033[0m"
-      if (v ~ /^(STOPPED|-)$/) return "\033[2m" p "\033[0m"
+      if (v ~ /^(RUNNING|allowlist|ALLOW|up|ready|idle)$/) return "\033[32m" p "\033[0m"
+      if (v ~ /^(open|DENY|down|missing|waiting|timeout)$/) return "\033[33m" p "\033[0m"
+      if (v ~ /^(STOPPED|-|exited|unknown)$/) return "\033[2m" p "\033[0m"
       return p }
     END { for (r = 1; r <= n; r++) { s = ""
             for (i = 1; i <= nf; i++) s = s paint(i < nf ? sprintf("%-" w[i] "s", c[r, i]) : c[r, i], c[r, i], r == 1) (i < nf ? "   " : "")
@@ -88,6 +88,8 @@ lxs run <box> claude|codex [--account ACC] [--name S] [--cwd DIR] ["prompt"]
                                     start an agent in tmux session S, logged in as ACC
                                     (ACC may be left out when only one account of that kind exists)
 lxs ps <box>                        agent sessions in a box
+lxs wait <box> <S> [--timeout SEC]  block while the agent works; prints its state and last reply
+                                    exit 0 idle (turn done), 2 waiting for an answer, 3 exited, 124 timeout
 lxs send <box> <S> "text"           type a message into a session and press Enter
 lxs logs <box> <S> [-n N]           last N lines of the session screen (default 60)
 lxs attach <box> <S>                attach your terminal to a session
@@ -444,6 +446,12 @@ box_new() {
   lxc file push --uid 1000 --gid 1000 --mode 0600 "$tmp/boxenv" "$b/home/agent/.boxenv"
   lxc file push --uid 1000 --gid 1000 --mode 0600 "$tmp/claude.json" "$b/home/agent/.claude.json"
   in_box "$b" 'mkdir -p ~/.codex ~/.claude'
+  # session status for `lxs wait` / `lxs ps`: Claude hooks report through lxs-status
+  lxc file push --mode 0755 "$SRC/box/lxs-status" "$b/usr/local/bin/lxs-status"
+  in_box "$b" 'f=~/.claude/settings.json; [ -f "$f" ] || echo "{}" > "$f"
+    h() { echo "[{\"hooks\": [{\"type\": \"command\", \"command\": \"lxs-status hook $1\"}]}]"; }
+    jq --argjson w "$(h working)" --argjson i "$(h idle)" --argjson n "$(h waiting)" --argjson x "$(h exited)" \
+      ".hooks += {UserPromptSubmit: \$w, Stop: \$i, Notification: \$n, SessionEnd: \$x}" "$f" > "$f.tmp" && mv "$f.tmp" "$f"'
   lxc file push --uid 1000 --gid 1000 --mode 0600 "$tmp/codex.toml" "$b/home/agent/.codex/config.toml"
 
   # ---- repos + setup ----
@@ -472,9 +480,10 @@ boxes_json() { # boxes_json [with_sessions=1]: one lxc query, plus a tmux look i
 }
 box_ls() { show "$(boxes_json)" "no boxes (lxs new <box> --env <env>)" '{box, state, env, egress, sessions, created}'; }
 box_ps() {
-  show "$(in_box "${1:?box}" "tmux ls -F '#S	#{session_created}	#{session_attached}	#{pane_current_command}' 2>/dev/null || true" \
-    | jq -Rnc '[inputs | split("\t") | {session: .[0], started: (.[1] | tonumber | strflocaltime("%Y-%m-%d %H:%M")),
-                attached: (.[2] != "0"), running: .[3]}]')" "(no sessions)"
+  show "$(in_box "${1:?box}" "tmux ls -F '#S	#{session_created}	#{session_attached}	#{pane_current_command}' 2>/dev/null |
+      while IFS=\$'\\t' read -r s c a p; do printf '%s\\t%s\\t%s\\t%s\\t%s\\n' \"\$s\" \"\$(jq -r .state ~/.lxs/status/\$s 2>/dev/null || echo unknown)\" \"\$c\" \"\$a\" \"\$p\"; done" \
+    | jq -Rnc '[inputs | split("\t") | {session: .[0], state: .[1], started: (.[2] | tonumber | strflocaltime("%Y-%m-%d %H:%M")),
+                attached: (.[3] != "0"), running: .[4]}]')" "(no sessions)"
 }
 status() {
   local up=down pid; pid=$(cat "$LXSANDBOX_HOME/egress.pid" 2>/dev/null || true)
@@ -559,6 +568,11 @@ agent_run() {
       cmd="export CODEX_HOME=~/.lxs/codex/$acc; codex --dangerously-bypass-approvals-and-sandbox" ;;
   esac
   [ -n "$prompt" ] && cmd+=" $(q "$prompt")"
+  cmd="export LXS_SESSION=$(q "$s"); $cmd"
+  if [ "$kind" = claude ]; then # a prompt means it's busy from the start; otherwise it waits for input
+    in_box "$b" "mkdir -p ~/.lxs/status && jq -n --arg st $([ -n "$prompt" ] && echo working || echo idle) \
+      --argjson t \$(date +%s) '{state: \$st, since: \$t, message: \"\"}' > ~/.lxs/status/$(q "$s")"
+  fi
   in_box "$b" "tmux new-session -d -s $(q "$s") -x 220 -y 50 -c $(q "$cwd") $(q "bash -lc $(q "$cmd; exec bash")")"
   echo "$s"
 }
@@ -575,13 +589,25 @@ pick_account() { # pick_account <claude|codex> [name] -> name, or the only one t
     *) die "several $k accounts, pick one with --account: $(paste -sd' ' <<<"$all")" ;;
   esac
 }
+agent_wait() { # agent_wait <box> <session> [--timeout SEC]: block while the agent works
+  local b=${1:?box} s=${2:?session} t=1800 out st; shift 2
+  while [ $# -gt 0 ]; do case "$1" in --timeout) t=$2; shift 2;; *) die "lxs wait <box> <session> [--timeout SEC]";; esac; done
+  [[ $t =~ ^[0-9]+$ ]] || die "--timeout takes seconds"
+  in_box "$b" 'command -v lxs-status >/dev/null' || die "box $b predates lxs wait (no lxs-status inside)"
+  out=$(in_box "$b" "lxs-status wait $(q "$s") $t" | jq -c '.since |= (if . then strflocaltime("%Y-%m-%d %H:%M:%S") else . end)')
+  st=$(jq -r .state <<<"$out")
+  show_obj "$(jq -c '{session, state, since, message}' <<<"$out")"
+  case "$st" in idle) return 0;; waiting) return 2;; exited) return 3;; timeout) return 124;; *) return 4;; esac
+}
 agent_send() { local b=$1 s=$2 t=$3
+  # mark it busy before typing, so a `lxs wait` right after doesn't see the previous turn's idle
+  in_box "$b" "f=~/.lxs/status/$(q "$s"); [ -f \$f ] && jq --argjson t \$(date +%s) '.state = \"working\" | .since = \$t | .message = \"\"' \$f > \$f.tmp && mv \$f.tmp \$f; true"
   in_box "$b" "tmux send-keys -t $(q "$s") -l $(q "$t") && sleep 0.3 && tmux send-keys -t $(q "$s") Enter"; }
 agent_logs() { local b=$1 s=$2 n=60; [ "${3:-}" = -n ] && n=$4
   in_box "$b" "tmux capture-pane -p -t $(q "$s") -S -$n"; }
 
 cmd=${1:-help}; shift || true
-case "$cmd" in ls|env|egress|account|ps|status|st) # --json anywhere in the args
+case "$cmd" in ls|env|egress|account|ps|status|st|wait) # --json anywhere in the args
   args=(); for a in "$@"; do if [ "$a" = --json ]; then JSON=1; else args+=("$a"); fi; done
   set -- ${args[@]+"${args[@]}"} ;; esac
 case "$cmd" in
@@ -602,6 +628,7 @@ case "$cmd" in
   ps) box_ps "$@" ;;
   send) agent_send "${1:?box}" "${2:?session}" "${3:?text}" ;;
   logs) agent_logs "$@" ;;
+  wait) agent_wait "$@" ;;
   attach) lxc exec "${1:?box}" -t -- sudo -iu agent tmux attach -t "${2:?session}" ;;
   kill) in_box "${1:?box}" "tmux kill-session -t $(q "${2:?session}")" ;;
   help|-h|--help) usage ;;

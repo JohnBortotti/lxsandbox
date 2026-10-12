@@ -27,7 +27,12 @@ bypass mode inside disposable sandboxes on a Linux host. It's one bash script, `
     lxs env new web                                   # MCP, network and secrets live in the env
     lxs new w1 --env web --repo owner/api             # repos land in /work on branch box/w1
     lxs run w1 claude --account personal --name main "read the repo and summarize it"
+    lxs wait w1 main                                  # blocks until the turn ends, prints the reply
     lxs logs w1 main; lxs send w1 main "now run the tests"; lxs attach w1 main
+
+`lxs wait` exits 0 when the agent finished its turn, 2 when it's waiting for an answer, 3 when the
+session is gone, 124 on `--timeout`. It reads Claude Code hooks that `lxs new` installs in the box,
+so `lxs ps` also shows each session as working / idle / waiting. Bots use it instead of polling `logs`.
 
 ## Concepts
 - **Golden:** container `lxsandbox-golden`, snapshot `base` (Debian trixie by default, `LXSANDBOX_IMAGE` to change).
