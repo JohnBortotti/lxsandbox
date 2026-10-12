@@ -89,12 +89,13 @@ lxs run <box> claude|codex [--account ACC] [--name S] [--cwd DIR] [--continue] [
                                     start an agent in tmux session S, logged in as ACC
                                     (ACC may be left out when only one account of that kind exists)
 lxs ps <box>                        agent sessions in a box
-lxs wait <box> <S> [--timeout SEC]  block while the agent works; prints its state and last reply
+lxs wait <box> [S] [--timeout SEC]  block while the agent works; prints its state and last reply
                                     exit 0 idle (turn done), 2 waiting for an answer, 3 exited, 124 timeout
-lxs send <box> <S> "text"           type a message into a session and press Enter
-lxs logs <box> <S> [-n N]           last N lines of the session screen (default 60)
-lxs attach <box> <S>                attach your terminal to a session
-lxs kill <box> <S>
+lxs send <box> [S] "text"           type a message into a session and press Enter
+lxs logs <box> [S] [-n N]           last N lines of the session screen (default 60)
+lxs attach <box> [S]                attach your terminal to a session
+lxs kill <box> [S]                  end a session
+                                    (S may be left out when the box has only one session)
 U
 }
 
@@ -606,8 +607,21 @@ agent_send() { local b=$1 s=$2 t=$3
   # mark it busy before typing, so a `lxs wait` right after doesn't see the previous turn's idle
   in_box "$b" "f=~/.lxs/status/$(q "$s"); [ -f \$f ] && jq --argjson t \$(date +%s) '.state = \"working\" | .since = \$t | .message = \"\"' \$f > \$f.tmp && mv \$f.tmp \$f; true"
   in_box "$b" "tmux send-keys -t $(q "$s") -l $(q "$t") && sleep 0.3 && tmux send-keys -t $(q "$s") Enter"; }
-agent_logs() { local b=$1 s=$2 n=60; [ "${3:-}" = -n ] && n=$4
+agent_logs() { # agent_logs <box> [session] [-n N]
+  local b=${1:?box} s="" n=60; shift
+  while [ $# -gt 0 ]; do case "$1" in -n) n=$2; shift 2;; *) s=$1; shift;; esac; done
+  [[ $n =~ ^[0-9]+$ ]] || die "-n takes a number of lines"
+  s=$(pick_session "$b" "$s")
   in_box "$b" "tmux capture-pane -p -t $(q "$s") -S -$n"; }
+pick_session() { # the named session, or the box's only one; with several, say which exist
+  local b=$1 s=${2:-} all; [ -n "$s" ] && { echo "$s"; return; }
+  is_box "$b" || die "no box $b"
+  all=$(in_box "$b" "tmux ls -F '#S' 2>/dev/null" || true)
+  case $(grep -c . <<<"$all") in
+    0) die "box $b has no sessions (lxs run $b claude ...)";;
+    1) echo "$all";;
+    *) die "box $b has several sessions, name one: $(paste -sd' ' <<<"$all")";;
+  esac; }
 
 cmd=${1:-help}; shift || true
 case "$cmd" in ls|env|egress|account|ps|status|st|wait) # --json anywhere in the args
@@ -629,11 +643,12 @@ case "$cmd" in
   snap) lxc snapshot "${1:?box}" ${2:+"$2"} ;;
   run) agent_run "$@" ;;
   ps) box_ps "$@" ;;
-  send) agent_send "${1:?box}" "${2:?session}" "${3:?text}" ;;
+  send) [ $# -ge 3 ] && agent_send "$1" "$2" "$3" || agent_send "${1:?box}" "$(pick_session "$1")" "${2:?text}" ;;
   logs) agent_logs "$@" ;;
-  wait) agent_wait "$@" ;;
-  attach) lxc exec "${1:?box}" -t -- sudo -iu agent tmux attach -t "${2:?session}" ;;
-  kill) in_box "${1:?box}" "tmux kill-session -t $(q "${2:?session}")" ;;
+  wait) b=${1:?box}; shift; s=""; [ $# -gt 0 ] && [[ $1 != --* ]] && { s=$1; shift; }
+    agent_wait "$b" "$(pick_session "$b" "$s")" "$@" ;;
+  attach) lxc exec "${1:?box}" -t -- sudo -iu agent tmux attach -t "$(pick_session "$1" "${2:-}")" ;;
+  kill) in_box "${1:?box}" "tmux kill-session -t $(q "$(pick_session "$1" "${2:-}")")" ;;
   help|-h|--help) usage ;;
   *) usage; exit 1 ;;
 esac
