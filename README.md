@@ -9,10 +9,12 @@ bypass mode inside disposable sandboxes on a Linux host. It's one bash script, `
 - **Envs:** named presets (accounts, MCP server, secrets, default repos, setup script).
 - **Many repos and many agents per box:** each agent runs in its own tmux session you can drive from scripts.
 - **Safe deletes:** `lxs rm` refuses while any repo in the box has unpushed work.
+- **Network allowlist per env:** boxes reach only the hosts their env allows, editable live.
 
 ## Requirements
 - Linux with LXD (`snap install lxd && lxd init`), a btrfs or zfs storage pool recommended.
-- `jq`, `git`, `gh` (optional), and `claude` / `codex` installed on the host (their binaries are copied into boxes).
+- `jq`, `git`, `python3` (for the egress proxy), `gh` (optional), and `claude` / `codex` installed on the host
+  (their binaries are copied into boxes).
 - If Docker runs on the host, its `FORWARD DROP` policy blocks LXD bridge traffic; see
   `host/lxd-docker-forward.service`.
 
@@ -37,6 +39,11 @@ bypass mode inside disposable sandboxes on a Linux host. It's one bash script, `
   (runs after repos are cloned).
 - **Box:** repos are bundled on the host (so private repos clone with your host credentials) into
   `/work/<repo>` on branch `box/<box>`, with `origin` pointing at the original remote.
+- **Repo specs** (`--repo R`, and `REPOS` in env.conf):
+  - `owner/name` → cloned fresh from GitHub with `gh`; a git url (`ssh://…`, `git@host:…`, `https://…`) →
+    cloned fresh with `git`. Both always start from the remote's latest state.
+  - a path, or a bare name found in `~/workspace/<name>` → your local checkout as it is, including
+    local commits and branches that aren't pushed yet (uncommitted changes are not copied).
 - **Session:** `lxs run` starts `claude --dangerously-skip-permissions` or
   `codex --dangerously-bypass-approvals-and-sandbox` in tmux as user `agent`.
 
@@ -46,6 +53,24 @@ bypass mode inside disposable sandboxes on a Linux host. It's one bash script, `
 - `~/.config/gh` is mounted read-only, so `gh pr create` works. The gh token is readable inside the box.
 - Remote hostnames without a dot (e.g. tailnet MagicDNS names) are pinned into the box's `/etc/hosts`.
 - After a host reboot the ssh-agent comes back with the next `lxs start` or `lxs new`.
+
+## Network (`EGRESS=allowlist`, the default for new envs; `--egress open` to opt out)
+- An allowlist box has **no network interface**. Its only way out is `lxsandbox-egress`, a small HTTP
+  proxy on a unix socket on the host, forwarded into the box as `127.0.0.1:3128`. Shells, sudo, apt,
+  Docker and ssh (via a `ProxyCommand`) are set up to use it; anything that ignores it simply has no route.
+- Each box authenticates with its own token and may reach only the hosts in its env's `egress.allow`,
+  plus the origin hosts of its repos. DNS resolves on the host, so tailnet names work if allowed.
+- The default list covers Anthropic, OpenAI, GitHub, npm, PyPI and Debian. Edit it from the CLI;
+  changes apply to running boxes immediately:
+
+      lxs egress show web
+      lxs egress allow web api.stripe.com '*.supabase.co' myhost:8443
+      lxs egress remove web pypi.org
+      lxs egress log -n 20              # ALLOW/DENY per request, to see what a box tried to reach
+      lxs egress mode web open          # for boxes created from now on
+
+- `lxs` starts the proxy on demand; `host/lxsandbox-egress.service` keeps it up across reboots.
+- Local MCP servers (`127.0.0.1` urls) and the ssh-agent are LXD proxy devices, not network, so they keep working.
 
 ## MCP servers (`--mcp HOOK[:SCOPE]`)
 A hook is an executable in `~/.lxsandbox/hooks/` that mints a credential per box and revokes it when the
@@ -60,10 +85,11 @@ added to Claude Code and Codex in the box; a `127.0.0.1` url on the host is forw
 Boxes are unprivileged system containers sharing the host kernel, with nesting enabled for Docker.
 That is weaker isolation than a VM. Anything given to a box (Claude token, MCP token, secrets.env,
 the gh token, use of the ssh-agent) is usable by the agents in it, and by anything that prompt-injects
-them. Network egress is open. Give each env only what it needs.
+them. With `EGRESS=allowlist` a box can only talk to the hosts you allowed, but an allowed host can still
+receive data (e.g. a gist on github.com). `EGRESS=open` boxes reach everything the host reaches, including
+your LAN and tailnet. Give each env only what it needs.
 
 ## TODO
-- Per-env network allowlist (egress proxy).
 - VM boxes (`lxc launch --vm`) where hardware virtualization is available.
 - An MCP server exposing `lxs` so other agents get typed tools.
 

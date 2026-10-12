@@ -1,0 +1,12 @@
+# Optional: keep the egress proxy running across reboots (otherwise lxs starts it on demand).
+#   cp host/lxsandbox-egress.service ~/.config/systemd/user/   # edit the path below first
+#   systemctl --user enable --now lxsandbox-egress; loginctl enable-linger "$USER"
+[Unit]
+Description=lxsandbox egress proxy
+
+[Service]
+ExecStart=/usr/bin/python3 %h/lxsandbox/lxsandbox-egress
+Restart=on-failure
+
+[Install]
+WantedBy=default.target

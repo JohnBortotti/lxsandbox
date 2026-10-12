@@ -12,7 +12,8 @@ LXSANDBOX_SSH_KEY=${LXSANDBOX_SSH_KEY:-$HOME/.ssh/id_ed25519}
 SRC=$(cd "$(dirname "$(readlink -f "$0")")" && pwd)
 GOLDEN=lxsandbox-golden
 AGENT_SOCK=$LXSANDBOX_HOME/ssh-agent.sock
-mkdir -p "$LXSANDBOX_HOME"/{envs,hooks,accounts/claude,accounts/codex}
+EGRESS_SOCK=$LXSANDBOX_HOME/egress.sock
+mkdir -p "$LXSANDBOX_HOME"/{envs,hooks,egress,accounts/claude,accounts/codex}
 chmod 700 "$LXSANDBOX_HOME"
 
 die() { echo "lxs: $*" >&2; exit 1; }
@@ -40,13 +41,19 @@ lxs account claude <name>           paste a token, or Enter to run claude setup-
 lxs account codex <name>            codex login into its own CODEX_HOME, shared by boxes
 lxs account ls
 
-lxs env new <env> [--claude ACC] [--codex ACC] [--mcp HOOK[:SCOPE]] [--repo R]... [--no-github]
+lxs env new <env> [--claude ACC] [--codex ACC] [--mcp HOOK[:SCOPE]] [--repo R]... [--no-github] [--egress open]
 lxs env ls | show <env> | edit <env> [env.conf|secrets.env|setup.sh] | rm <env>
 
-lxs new <box> --env <env> [--repo R]...   R = a local path, ~/workspace/<dir>, or owner/name
+lxs new <box> --env <env> [--repo R]...   R = a local path, ~/workspace/<dir>, owner/name or a git url
 lxs ls | shell <box> | snap <box> [name] | stop <box> | start <box>
 lxs rm <box> [--force]              refuses if a /work repo has unpushed or uncommitted work
 lxs prune [--yes]                   list (or delete) idle boxes with nothing unsaved
+
+lxs egress show <env>               network mode and allowlist (allowlist edits apply to running boxes)
+lxs egress allow <env> HOST...      HOST = example.com, *.example.com or host:port
+lxs egress remove <env> HOST...
+lxs egress mode <env> allowlist|open   for boxes created from now on
+lxs egress log [-n N]               recent ALLOW/DENY decisions
 
 lxs run <box> claude|codex [--name S] [--cwd DIR] ["prompt"]   start an agent in tmux session S
 lxs ps <box>                        agent sessions in a box
@@ -117,15 +124,17 @@ env_new() {
   local e=${1:?env name}; shift
   [[ $e =~ ^[a-z0-9-]+$ ]] || die "env names: a-z 0-9 -"
   local d="$LXSANDBOX_HOME/envs/$e"; [ -e "$d" ] && die "env $e exists"
-  local claude_acc="" codex_acc="" mcp="" github=host repos=()
+  local claude_acc="" codex_acc="" mcp="" github=host egress=allowlist repos=()
   while [ $# -gt 0 ]; do case "$1" in
     --claude) claude_acc=$2; shift 2;;
     --codex) codex_acc=$2; shift 2;;
     --mcp) mcp=$2; shift 2;;
     --repo) repos+=("$2"); shift 2;;
     --no-github) github=off; shift;;
+    --egress) egress=$2; shift 2;;
     *) die "unknown flag $1";; esac; done
   [ -z "$mcp" ] || [ -x "$LXSANDBOX_HOME/hooks/${mcp%%:*}" ] || die "no MCP hook $LXSANDBOX_HOME/hooks/${mcp%%:*} (see examples/)"
+  [[ $egress == allowlist || $egress == open ]] || die "--egress allowlist|open"
   mkdir -p "$d"; chmod 700 "$d"
   cat > "$d/env.conf" <<C
 # lxsandbox env: $e
@@ -134,11 +143,13 @@ CODEX_ACCOUNT=$codex_acc     # name under accounts/codex, empty = not logged in
 MCP=$mcp               # HOOK[:SCOPE]: hooks/HOOK mints a per-box MCP url + token; empty = none
 GITHUB=$github           # host = forward the host's ssh-agent + gh login into boxes; off = none
 REPOS="${repos[*]:-}"    # default repos for new boxes
+EGRESS=$egress   # allowlist = only hosts in egress.allow (lxs egress ...); open = unrestricted
 CPU=4
 MEMORY=8GiB
 C
   ( umask 077; printf '# KEY=value lines, exported inside the box\n' > "$d/secrets.env" )
   printf '#!/usr/bin/env bash\n# runs as agent inside the box after repos are cloned (cwd /work)\n' > "$d/setup.sh"
+  egress_default > "$d/egress.allow"
   echo "env $e created: $d"
 }
 env_cmd() {
@@ -146,8 +157,8 @@ env_cmd() {
   case "$sub" in
     new) env_new "$@" ;;
     ls) for d in "$LXSANDBOX_HOME"/envs/*/; do [ -d "$d" ] || continue
-          ( . "$d/env.conf"; printf '%-16s claude=%-10s codex=%-10s mcp=%-14s github=%-5s repos=%s\n' "$(basename "$d")" \
-              "${CLAUDE_ACCOUNT:--}" "${CODEX_ACCOUNT:--}" "${MCP:--}" "${GITHUB:-off}" "${REPOS:--}" ); done ;;
+          ( . "$d/env.conf"; printf '%-16s claude=%-10s codex=%-10s mcp=%-14s github=%-5s egress=%-9s repos=%s\n' "$(basename "$d")" \
+              "${CLAUDE_ACCOUNT:--}" "${CODEX_ACCOUNT:--}" "${MCP:--}" "${GITHUB:-off}" "${EGRESS:-open}" "${REPOS:--}" ); done ;;
     show) need_env "$1"; cat "$LXSANDBOX_HOME/envs/$1/env.conf"
           echo "secrets: $(grep -c '^[A-Za-z_]' "$LXSANDBOX_HOME/envs/$1/secrets.env" || true) keys" ;;
     edit) need_env "$1"; "${EDITOR:-vi}" "$LXSANDBOX_HOME/envs/$1/${2:-env.conf}" ;;
@@ -161,11 +172,13 @@ env_cmd() {
 }
 
 # ---------- repos ----------
-resolve_repo() { # print a local git dir for R; owner/name is cloned on the host into a temp dir
-  local r=$1
-  if [ -d "$r/.git" ]; then readlink -f "$r"
+resolve_repo() { # print a local git dir for R; owner/name and git urls are cloned fresh on the host
+  local r=$1 t=${CLONE_DIR:-$(mktemp -d)} n
+  n=$(basename "${r%.git}")
+  if [[ $r =~ ^(ssh|https?|git):// || $r =~ ^[^/:]+@[^/:]+: ]]; then git clone -q "$r" "$t/$n" >&2; echo "$t/$n"
+  elif [ -d "$r/.git" ]; then readlink -f "$r"
   elif [ -d "$HOME/workspace/$r/.git" ]; then echo "$HOME/workspace/$r"
-  elif [[ $r == */* ]]; then local t; t=$(mktemp -d); gh repo clone "$r" "$t/$(basename "$r")" -- -q >&2; echo "$t/$(basename "$r")"
+  elif [[ $r == */* ]]; then gh repo clone "$r" "$t/$n" -- -q >&2; echo "$t/$n"
   else die "repo not found: $r"; fi
 }
 push_repo() { # bundle all refs of a host repo, clone it into /work/<name> on a new branch box/<box>
@@ -179,6 +192,7 @@ push_repo() { # bundle all refs of a host repo, clone it into /work/<name> on a 
     && ${origin:+git remote set-url origin $(q "$origin") &&} rm -f /tmp/$(q "$name").bundle"
   # A dotless origin host only resolves on the host (e.g. tailnet MagicDNS): pin it in the box.
   host=$(sed -E 's#^[a-z+]+://##; s#^[^@/]*@##; s#[:/].*$##' <<<"$origin")
+  [ -n "$host" ] && [ -f "$LXSANDBOX_HOME/egress/$b" ] && echo "$host" >> "$LXSANDBOX_HOME/egress/$b"
   if [ -n "$host" ] && [[ $host != *.* ]]; then
     ip=$(getent hosts "$host" | awk '{print $1; exit}')
     [ -n "$ip" ] && lxc exec "$b" -- sh -c "grep -q ' $host\$' /etc/hosts || echo '$ip $host' >> /etc/hosts"
@@ -203,13 +217,107 @@ github_devices() {
 github_config() {
   local b=$1 tmp=$2
   echo "export SSH_AUTH_SOCK=/home/agent/.ssh-agent.sock" >> "$tmp/boxenv"
-  in_box "$b" 'mkdir -p ~/.ssh && chmod 700 ~/.ssh'
   [ -f "$HOME/.ssh/known_hosts" ] && lxc file push --uid 1000 --gid 1000 --mode 0600 "$HOME/.ssh/known_hosts" "$b/home/agent/.ssh/known_hosts"
-  printf 'IgnoreUnknown *\nHost *\n  StrictHostKeyChecking accept-new\n' > "$tmp/sshconfig"
+  printf 'Host *\n  StrictHostKeyChecking accept-new\n' >> "$tmp/sshconfig"
   [ -f "$HOME/.ssh/config" ] && cat "$HOME/.ssh/config" >> "$tmp/sshconfig"
-  lxc file push --uid 1000 --gid 1000 --mode 0600 "$tmp/sshconfig" "$b/home/agent/.ssh/config"
   in_box "$b" "git config --global user.name $(q "$(git config --global user.name)") && \
     git config --global user.email $(q "$(git config --global user.email)") && gh auth setup-git >/dev/null 2>&1 || true"
+}
+
+# ---------- egress: EGRESS=allowlist boxes have no NIC, only the host proxy (lxsandbox-egress) ----------
+egress_default() { cat <<'A'
+# Hosts boxes of this env may reach: example.com, *.example.com (subdomains), host:port.
+# Edit with lxs egress allow|remove; changes apply to running boxes at once. Repo origins are added per box.
+api.anthropic.com
+api.openai.com
+auth.openai.com
+chatgpt.com
+github.com
+*.github.com
+*.githubusercontent.com
+registry.npmjs.org
+pypi.org
+files.pythonhosted.org
+deb.debian.org
+A
+}
+ensure_egress() { # start the proxy unless it's already running (a systemd unit may run it too)
+  [ -S "$EGRESS_SOCK" ] && kill -0 "$(cat "$LXSANDBOX_HOME/egress.pid" 2>/dev/null)" 2>/dev/null && return
+  command -v python3 >/dev/null || die "the egress proxy needs python3 on the host"
+  LXSANDBOX_HOME=$LXSANDBOX_HOME setsid nohup python3 "$SRC/lxsandbox-egress" >>"$LXSANDBOX_HOME/egress.err" 2>&1 </dev/null &
+  for _ in $(seq 30); do [ -S "$EGRESS_SOCK" ] && return; sleep 0.1; done
+  die "egress proxy didn't start, see $LXSANDBOX_HOME/egress.err"
+}
+egress_devices() { # before first start: drop the NIC, forward the proxy in, register the box's token
+  local b=$1 e=$2 tok; ensure_egress
+  tok=$(head -c 32 /dev/urandom | base64 | tr -dc A-Za-z0-9 | head -c 32)
+  ( umask 077; printf '%s\n%s\n' "$tok" "$e" > "$LXSANDBOX_HOME/egress/$b" )
+  lxc config device add "$b" eth0 none >/dev/null
+  lxc config device add "$b" egress proxy bind=instance listen=tcp:127.0.0.1:3128 connect="unix:$EGRESS_SOCK" >/dev/null
+  EGRESS_AUTH="$b:$tok"
+}
+egress_config() { # inside the box: proxy env for shells, sudo, apt, docker and ssh
+  local b=$1 tmp=$2 url="http://$EGRESS_AUTH@127.0.0.1:3128"
+  local np="localhost,127.0.0.1,::1"
+  printf 'export HTTP_PROXY=%s HTTPS_PROXY=%s http_proxy=%s https_proxy=%s NO_PROXY=%s no_proxy=%s\n' \
+    "$url" "$url" "$url" "$url" "$np" "$np" >> "$tmp/boxenv"
+  echo "export CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1" >> "$tmp/boxenv"
+  printf 'Acquire::http::Proxy "%s";\nAcquire::https::Proxy "%s";\n' "$url" "$url" > "$tmp/apt"
+  printf '[Service]\nEnvironment="HTTP_PROXY=%s" "HTTPS_PROXY=%s" "NO_PROXY=%s"\n' "$url" "$url" "$np" > "$tmp/docker"
+  cat > "$tmp/connect" <<'S'
+#!/usr/bin/env bash
+# ssh ProxyCommand: tunnel to $1:$2 through the lxsandbox egress proxy (HTTP CONNECT)
+exec 3<>/dev/tcp/127.0.0.1/3128 || exit 1
+printf 'CONNECT %s:%s HTTP/1.1\r\nHost: %s:%s\r\nProxy-Authorization: Basic %s\r\n\r\n' \
+  "$1" "$2" "$1" "$2" "$(printf %s "$(cat /etc/lxsandbox/proxy-auth)" | base64 -w0)" >&3
+IFS= read -r status <&3
+case "$status" in *" 200 "*) ;; *) echo "lxsandbox egress: $1:$2 refused: ${status%$'\r'}" >&2; exit 1 ;; esac
+while IFS= read -r line <&3 && [ -n "${line%$'\r'}" ]; do :; done
+cat <&3 & cat >&3; kill $! 2>/dev/null
+S
+  printf 'ProxyCommand /usr/local/bin/lxs-connect %%h %%p\n' >> "$tmp/sshconfig"
+  lxc exec "$b" -- mkdir -p /etc/lxsandbox /etc/systemd/system/docker.service.d
+  printf '%s' "$EGRESS_AUTH" | lxc file push --mode 0644 - "$b/etc/lxsandbox/proxy-auth"
+  lxc file push --mode 0755 "$tmp/connect" "$b/usr/local/bin/lxs-connect"
+  lxc file push --mode 0644 "$tmp/apt" "$b/etc/apt/apt.conf.d/99lxsandbox-proxy"
+  lxc file push --mode 0644 "$tmp/docker" "$b/etc/systemd/system/docker.service.d/lxsandbox-proxy.conf"
+  echo 'Defaults env_keep += "HTTP_PROXY HTTPS_PROXY http_proxy https_proxy NO_PROXY no_proxy"' \
+    | lxc file push --mode 0440 - "$b/etc/sudoers.d/lxsandbox-proxy"
+  # With only loopback, getaddrinfo(AI_ADDRCONFIG) refuses even 127.0.0.1 (apt hits this): add a
+  # dummy interface. It has no routes, so it opens no way out. Waiting for the network at boot is pointless.
+  printf '[Unit]\nDefaultDependencies=no\nBefore=network-pre.target sysinit.target\n[Service]\nType=oneshot\nRemainAfterExit=yes\nExecStart=/bin/sh -c "ip link add lxs0 type dummy 2>/dev/null; ip addr replace 10.255.255.1/32 dev lxs0; ip link set lxs0 up"\n[Install]\nWantedBy=multi-user.target\n' \
+    | lxc file push --mode 0644 - "$b/etc/systemd/system/lxs-dummy.service"
+  lxc exec "$b" -- sh -c 'systemctl mask systemd-networkd-wait-online; systemctl daemon-reload; systemctl enable --now lxs-dummy; systemctl try-restart docker' >/dev/null 2>&1 || true
+}
+egress_host() { # normalize a pasted url or host to a pattern
+  local h=${1#*://}; h=${h%%/*}; h=${h##*@}; echo "${h,,}"
+}
+egress_cmd() {
+  local sub=${1:-}; shift || true
+  case "$sub" in
+    show) need_env "${1:?env}"; local f="$LXSANDBOX_HOME/envs/$1/egress.allow"
+          ( . "$LXSANDBOX_HOME/envs/$1/env.conf"; echo "mode: ${EGRESS:-open}" )
+          [ -f "$f" ] && grep -v '^\s*#' "$f" | sed '/^\s*$/d;s/^/  /' || echo "  (no allowlist)" ;;
+    allow|remove)
+      local e=${1:?env}; shift; need_env "$e"; local f="$LXSANDBOX_HOME/envs/$e/egress.allow" h
+      [ $# -gt 0 ] || die "lxs egress $sub <env> HOST..."
+      [ -f "$f" ] || egress_default > "$f"
+      for h in "$@"; do h=$(egress_host "$h"); [[ $h =~ ^(\*\.)?[a-z0-9.-]+(:[0-9]+)?$|^\*$ ]] || die "bad host: $h"
+        if [ "$sub" = allow ]; then
+          grep -qxF "$h" "$f" && echo "already allowed: $h" || { echo "$h" >> "$f"; echo "allowed: $h"; }
+        else
+          grep -qxF "$h" "$f" || { echo "not in the list: $h"; continue; }
+          grep -vxF "$h" "$f" > "$f.tmp"; mv "$f.tmp" "$f"; echo "removed: $h"
+        fi; done ;;
+    mode) local e=${1:?env} m=${2:?allowlist|open}; need_env "$e"
+          [[ $m == allowlist || $m == open ]] || die "mode is allowlist or open"
+          local c="$LXSANDBOX_HOME/envs/$e/env.conf"
+          if grep -q '^EGRESS=' "$c"; then sed -i -E "s/^EGRESS=[a-z]*/EGRESS=$m/" "$c"; else echo "EGRESS=$m" >> "$c"; fi
+          [ -f "$LXSANDBOX_HOME/envs/$e/egress.allow" ] || egress_default > "$LXSANDBOX_HOME/envs/$e/egress.allow"
+          echo "env $e: egress $m for new boxes (existing boxes keep their mode)" ;;
+    log) local n=40; [ "${1:-}" = -n ] && n=$2; tail -n "$n" "$LXSANDBOX_HOME/egress.log" 2>/dev/null || true ;;
+    *) die "lxs egress show|allow|remove|mode|log" ;;
+  esac
 }
 
 # ---------- mcp: hooks/<HOOK> mint <box> <scope> → {"url","token"}; hooks/<HOOK> revoke <box> ----------
@@ -260,10 +368,12 @@ box_new() {
   [ -n "${CODEX_ACCOUNT:-}" ] && lxc config device add "$b" codex-auth disk \
     source="$LXSANDBOX_HOME/accounts/codex/$CODEX_ACCOUNT" path=/mnt/codex-auth shift=true >/dev/null
   [ "${GITHUB:-off}" = host ] && github_devices "$b"
+  [ "${EGRESS:-open}" = allowlist ] && egress_devices "$b" "$e"
   lxc start "$b"; wait_up "$b"
 
   # ---- agent config, built on the host and pushed in ----
   local tmp mcp_name=${MCP%%:*}; tmp=$(mktemp -d); trap 'rm -rf "$tmp"' RETURN
+  local CLONE_DIR="$tmp"
   {
     echo "# generated by lxsandbox for env $e"
     echo "export DISABLE_AUTOUPDATER=1 IS_SANDBOX=1"
@@ -271,7 +381,11 @@ box_new() {
     [ -n "$mcp_token" ] && echo "export MCP_TOKEN=$(q "$mcp_token")"
     grep -E '^[A-Za-z_][A-Za-z0-9_]*=' "$d/secrets.env" | sed 's/^/export /' || true
   } > "$tmp/boxenv"
+  printf 'IgnoreUnknown *\n' > "$tmp/sshconfig"
+  [ "${EGRESS:-open}" = allowlist ] && egress_config "$b" "$tmp"
   [ "${GITHUB:-off}" = host ] && github_config "$b" "$tmp"
+  in_box "$b" 'mkdir -p ~/.ssh && chmod 700 ~/.ssh'
+  lxc file push --uid 1000 --gid 1000 --mode 0600 "$tmp/sshconfig" "$b/home/agent/.ssh/config"
   jq -n --arg name "$mcp_name" --arg url "$mcp_url" --arg tok "$mcp_token" '{
       hasCompletedOnboarding: true, bypassPermissionsModeAccepted: true,
       projects: {"/work": {hasTrustDialogAccepted: true}},
@@ -324,7 +438,7 @@ with_running() { # run "$@" with box $1 running, starting it temporarily if it w
   [ "$was" = RUNNING ] || lxc stop "$b" --timeout 30 >/dev/null 2>&1 || lxc stop -f "$b"
   return $rc
 }
-box_delete() { mcp_revoke "$1"; lxc delete -f "$1"; }
+box_delete() { mcp_revoke "$1"; lxc delete -f "$1"; rm -f "$LXSANDBOX_HOME/egress/$1"; }
 box_rm() {
   local b=${1:?box} force=${2:-} rep
   is_box "$b" || die "$b is not a box"
@@ -348,6 +462,7 @@ box_prune() {
 }
 box_start() {
   lxc config device get "${1:?box}" ssh-agent connect >/dev/null 2>&1 && ensure_agent
+  lxc config device get "$1" egress connect >/dev/null 2>&1 && ensure_egress
   lxc start "$1"
 }
 
@@ -375,6 +490,7 @@ case "$cmd" in
   image) case "${1:-}" in build) image_build;; refresh-cli) image_refresh_cli;; *) die "lxs image build|refresh-cli";; esac ;;
   account) account "$@" ;;
   env) env_cmd "$@" ;;
+  egress) egress_cmd "$@" ;;
   new) box_new "$@" ;;
   ls) box_ls ;;
   rm) box_rm "$@" ;;

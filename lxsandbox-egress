@@ -1,0 +1,146 @@
+#!/usr/bin/env python3
+"""lxsandbox egress proxy.
+
+An HTTP proxy (CONNECT for TLS/ssh, plain forwarding for http://) listening on a unix socket on the
+host. Boxes with EGRESS=allowlist have no network interface; their only way out is this socket,
+forwarded into the box as 127.0.0.1:3128. Each box authenticates with its own token and may only
+reach the hosts its env allows. Allowlists are re-read on every request, so edits apply at once.
+
+Files under $LXSANDBOX_HOME (default ~/.lxsandbox):
+  egress.sock               the socket
+  egress.pid                pid of the running proxy
+  egress.log                one line per request: time, box, ALLOW/DENY, host:port
+  egress/<box>              line 1 token, line 2 env, then extra patterns for that box only
+  envs/<env>/egress.allow   patterns: host, *.domain (subdomains), host:port, # comments
+"""
+import asyncio, base64, hmac, os, time
+from urllib.parse import urlsplit
+
+HOME = os.environ.get("LXSANDBOX_HOME") or os.path.expanduser("~/.lxsandbox")
+SOCK = os.path.join(HOME, "egress.sock")
+
+
+def patterns(lines):
+    out = []
+    for line in lines:
+        p = line.split("#", 1)[0].strip().lower()
+        if p:
+            out.append(p)
+    return out
+
+
+def policy(auth):
+    """Proxy-Authorization value -> (box, patterns), or (None, None) if it doesn't check out."""
+    try:
+        scheme, value = auth.split(None, 1)
+        box, token = base64.b64decode(value).decode().split(":", 1)
+        assert scheme.lower() == "basic" and box and "/" not in box and not box.startswith(".")
+        with open(os.path.join(HOME, "egress", box)) as f:
+            lines = f.read().split("\n")
+    except Exception:
+        return None, None
+    if len(lines) < 2 or not hmac.compare_digest(lines[0], token):
+        return None, None
+    pats = patterns(lines[2:])
+    try:
+        with open(os.path.join(HOME, "envs", lines[1], "egress.allow")) as f:
+            pats += patterns(f.read().split("\n"))
+    except OSError:
+        pass
+    return box, pats
+
+
+def allowed(host, port, pats):
+    host = host.lower().rstrip(".")
+    for p in pats:
+        h, _, pp = p.rpartition(":") if p.count(":") == 1 else (p, "", "")
+        if pp and pp != str(port):
+            continue
+        if h == "*" or h == host or (h.startswith("*.") and host.endswith(h[1:])):
+            return True
+    return False
+
+
+def log(box, verdict, host, port):
+    with open(os.path.join(HOME, "egress.log"), "a") as f:
+        f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {box} {verdict} {host}:{port}\n")
+
+
+async def pipe(src, dst):
+    try:
+        while data := await src.read(65536):
+            dst.write(data)
+            await dst.drain()
+        if dst.can_write_eof():
+            dst.write_eof()
+    except Exception:
+        pass
+
+
+def reply(w, status, text=""):
+    w.write(f"HTTP/1.1 {status}\r\nContent-Type: text/plain\r\nContent-Length: {len(text)}\r\n"
+            f"Proxy-Authenticate: Basic realm=\"lxsandbox\"\r\nConnection: close\r\n\r\n{text}".encode())
+
+
+async def handle(r, w):
+    up = None
+    try:
+        head = (await asyncio.wait_for(r.readuntil(b"\r\n\r\n"), 30)).decode("latin-1")
+        first, *headers = [l for l in head.split("\r\n") if l]
+        method, target, version = first.split(" ", 2)
+        auth = next((h.split(":", 1)[1].strip() for h in headers if h.lower().startswith("proxy-authorization:")), "")
+        box, pats = policy(auth)
+        if box is None:
+            reply(w, "407 Proxy Authentication Required", "lxsandbox: unknown box or token\n")
+            return
+        if method == "CONNECT":
+            host, port = target.rsplit(":", 1)
+            port = int(port)
+        else:
+            u = urlsplit(target)
+            if u.scheme != "http" or not u.hostname:
+                reply(w, "400 Bad Request", "lxsandbox: only http:// urls or CONNECT\n")
+                return
+            host, port = u.hostname, u.port or 80
+        if not allowed(host, port, pats):
+            log(box, "DENY", host, port)
+            reply(w, "403 Forbidden", f"lxsandbox: {host}:{port} is not allowed for box {box}. "
+                                      f"Allow it on the host with: lxs egress allow <env> {host}\n")
+            return
+        log(box, "ALLOW", host, port)
+        try:
+            ur, up = await asyncio.wait_for(asyncio.open_connection(host, port), 15)
+        except Exception as e:
+            reply(w, "502 Bad Gateway", f"lxsandbox: can't reach {host}:{port}: {e}\n")
+            return
+        if method == "CONNECT":
+            w.write(b"HTTP/1.1 200 Connection established\r\n\r\n")
+        else:
+            path = (u.path or "/") + (f"?{u.query}" if u.query else "")
+            keep = [h for h in headers if h.split(":", 1)[0].strip().lower()
+                    not in ("proxy-authorization", "proxy-connection", "connection", "keep-alive")]
+            up.write(f"{method} {path} {version}\r\n".encode("latin-1")
+                     + "".join(h + "\r\n" for h in keep).encode("latin-1") + b"Connection: close\r\n\r\n")
+        await asyncio.gather(pipe(r, up), pipe(ur, w))
+    except Exception:
+        pass
+    finally:
+        for x in (up, w):
+            if x:
+                x.close()
+
+
+async def main():
+    old = os.umask(0o077)
+    if os.path.exists(SOCK):
+        os.unlink(SOCK)
+    server = await asyncio.start_unix_server(handle, SOCK)
+    os.umask(old)
+    with open(os.path.join(HOME, "egress.pid"), "w") as f:
+        f.write(str(os.getpid()))
+    async with server:
+        await server.serve_forever()
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
