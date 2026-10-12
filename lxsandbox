@@ -293,6 +293,8 @@ box_new() {
 
   # ---- repos + setup ----
   local r; for r in ${REPOS:-} "${extra[@]}"; do [ -n "$r" ] && push_repo "$b" "$(resolve_repo "$r")"; done
+  # Claude trusts folders by exact path, so mark every repo as trusted too.
+  in_box "$b" 'f=~/.claude.json; for d in /work/*/; do d=${d%/}; jq --arg d "$d" ".projects[\$d].hasTrustDialogAccepted = true" "$f" > "$f.tmp" && mv "$f.tmp" "$f"; done; chmod 600 "$f"'
   if grep -qv '^#' "$d/setup.sh" 2>/dev/null; then
     lxc file push --uid 1000 --gid 1000 --mode 0700 "$d/setup.sh" "$b/home/agent/.box-setup.sh"
     in_box "$b" 'cd /work && ~/.box-setup.sh'
