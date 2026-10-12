@@ -24,7 +24,7 @@ bypass mode inside disposable sandboxes on a Linux host. It's one bash script, `
     lxs image build                                   # golden container + snapshot (once)
     lxs account claude personal                       # claude setup-token, stored for boxes
     lxs account codex personal                        # codex login into its own CODEX_HOME
-    lxs env new web --mcp executor:web
+    lxs env new web                                   # MCP, network and secrets live in the env
     lxs new w1 --env web --repo owner/api             # repos land in /work on branch box/w1
     lxs run w1 claude --account personal --name main "read the repo and summarize it"
     lxs logs w1 main; lxs send w1 main "now run the tests"; lxs attach w1 main
