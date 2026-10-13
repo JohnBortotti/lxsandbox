@@ -85,9 +85,10 @@ lxs egress remove <env> HOST...
 lxs egress mode <env> allowlist|open   for boxes created from now on
 lxs egress log [-n N] [--box B]     recent ALLOW/DENY decisions
 
-lxs run <box> claude|codex [--account ACC] [--name S] [--cwd DIR] [--continue] ["prompt"]
+lxs run <box> claude|codex [--account ACC] [--name S] [--cwd DIR] [--continue] [--remote-control] ["prompt"]
                                     start an agent in tmux session S, logged in as ACC
-                                    (ACC may be left out when only one account of that kind exists)
+                                    (ACC may be left out when only one account of that kind exists;
+                                    --remote-control needs a full claude login, setup-token accounts can't)
 lxs ps <box>                        agent sessions in a box
 lxs wait <box> [S] [--timeout SEC]  block while the agent works; prints its state and last reply
                                     exit 0 idle (turn done), 2 waiting for an answer, 3 exited, 124 timeout
@@ -547,8 +548,8 @@ box_start() {
 
 # ---------- agent sessions ----------
 agent_run() {
-  local b=${1:?box} kind=${2:?claude|codex}; shift 2; local s="" cwd=/work prompt="" acc="" cont="" cmd
-  while [ $# -gt 0 ]; do case "$1" in --name) s=$2; shift 2;; --cwd) cwd=$2; shift 2;; --account) acc=$2; shift 2;; --continue) cont=1; shift;;
+  local b=${1:?box} kind=${2:?claude|codex}; shift 2; local s="" cwd=/work prompt="" acc="" cont="" rc="" cmd
+  while [ $# -gt 0 ]; do case "$1" in --name) s=$2; shift 2;; --cwd) cwd=$2; shift 2;; --account) acc=$2; shift 2;; --continue) cont=1; shift;; --remote-control) rc=1; shift;;
     *) prompt=$1; shift;; esac; done
   is_box "$b" || die "no box $b"
   [[ $kind == claude || $kind == codex ]] || die "agent must be claude or codex"
@@ -571,6 +572,8 @@ agent_run() {
   esac
   # --continue picks up the last conversation in the box (claude --continue, codex resume --last)
   if [ -n "$cont" ]; then [ "$kind" = claude ] && cmd+=" --continue" || cmd=${cmd/codex /codex resume --last }; fi
+  # --remote-control: drive the session from claude.ai / the Claude app, named <box>/<session>
+  if [ -n "$rc" ]; then [ "$kind" = claude ] || die "--remote-control is claude only"; cmd+=" --remote-control $(q "$b/$s")"; fi
   [ -n "$prompt" ] && cmd+=" $(q "$prompt")"
   cmd="export LXS_SESSION=$(q "$s"); $cmd"
   if [ "$kind" = claude ]; then # a prompt means it's busy from the start; otherwise it waits for input
