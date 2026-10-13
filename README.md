@@ -41,6 +41,9 @@ so `lxs ps` also shows each session as working / idle / waiting. Bots use it ins
   `CLAUDE_CODE_OAUTH_TOKEN`. Codex uses one `CODEX_HOME` per account, mounted into boxes so token
   refreshes are shared. Accounts are not tied to envs: `lxs run --account` picks one per session, so
   one box can run agents on different accounts (left out when only one account of that kind exists).
+- **Run defaults:** an env's `env.conf` can set `CLAUDE_ACCOUNT`, `CLAUDE_MODEL`, `CLAUDE_EFFORT` (and the
+  `CODEX_*` equivalents). `lxs run` uses them when `--account`, `--model` or `--effort` is left out, so
+  every box of that env starts its agents the same way.
 - **Env** (`~/.lxsandbox/envs/<env>/`): `env.conf`, `secrets.env` (exported inside the box), `setup.sh`
   (runs after repos are cloned).
 - **Box:** repos are bundled on the host (so private repos clone with your host credentials) into

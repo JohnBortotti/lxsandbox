@@ -86,9 +86,10 @@ lxs egress remove <env> HOST...
 lxs egress mode <env> allowlist|open   for boxes created from now on
 lxs egress log [-n N] [--box B]     recent ALLOW/DENY decisions
 
-lxs run <box> claude|codex [--account ACC] [--name S] [--cwd DIR] [--continue] [--remote-control] ["prompt"]
+lxs run <box> claude|codex [--account ACC] [--model M] [--effort E] [--name S] [--cwd DIR] [--continue] [--remote-control] ["prompt"]
                                     start an agent in tmux session S, logged in as ACC
-                                    (ACC may be left out when only one account of that kind exists;
+                                    (ACC, M and E default to CLAUDE_*/CODEX_* in the env's env.conf;
+                                    ACC may also be left out when only one account of that kind exists;
                                     --remote-control needs a full claude login, setup-token accounts can't)
 lxs ps <box>                        agent sessions in a box
 lxs wait <box> [S] [--timeout SEC]  block while the agent works; prints its state and last reply
@@ -185,6 +186,12 @@ GITHUB=$github           # host = forward the host's ssh-agent + gh login into b
 EGRESS=$egress   # allowlist = only hosts in egress.allow (lxs egress ...); open = unrestricted
 CPU=4
 MEMORY=8GiB
+CLAUDE_ACCOUNT=    # defaults for lxs run (a flag overrides): account name, model id, effort level
+CLAUDE_MODEL=
+CLAUDE_EFFORT=
+CODEX_ACCOUNT=
+CODEX_MODEL=
+CODEX_EFFORT=
 C
   ( umask 077; printf '# KEY=value lines, exported inside the box\n' > "$d/secrets.env" )
   printf '#!/usr/bin/env bash\n# runs as agent inside the box after repos are cloned (cwd /work)\n' > "$d/setup.sh"
@@ -575,11 +582,20 @@ box_start() {
 
 # ---------- agent sessions ----------
 agent_run() {
-  local b=${1:?box} kind=${2:?claude|codex}; shift 2; local s="" cwd=/work prompt="" acc="" cont="" rc="" cmd
+  local b=${1:?box} kind=${2:?claude|codex}; shift 2; local s="" cwd=/work prompt="" acc="" cont="" rc="" model="" effort="" cmd
   while [ $# -gt 0 ]; do case "$1" in --name) s=$2; shift 2;; --cwd) cwd=$2; shift 2;; --account) acc=$2; shift 2;; --continue) cont=1; shift;; --remote-control) rc=1; shift;;
-    *) prompt=$1; shift;; esac; done
+    --model) model=$2; shift 2;; --effort) effort=$2; shift 2;; *) prompt=$1; shift;; esac; done
   is_box "$b" || die "no box $b"
   [[ $kind == claude || $kind == codex ]] || die "agent must be claude or codex"
+  # Flags win; otherwise the box's env.conf sets the defaults (CLAUDE_ACCOUNT, CLAUDE_MODEL, CLAUDE_EFFORT, CODEX_...).
+  local K=${kind^^} conf; conf="$LXSANDBOX_HOME/envs/$(lxc config get "$b" user.lxsandbox.env)/env.conf"
+  if [ -f "$conf" ]; then
+    acc=${acc:-$( . "$conf"; v=${K}_ACCOUNT; echo "${!v:-}")}
+    model=${model:-$( . "$conf"; v=${K}_MODEL; echo "${!v:-}")}
+    effort=${effort:-$( . "$conf"; v=${K}_EFFORT; echo "${!v:-}")}
+  fi
+  [[ -z $model || $model =~ ^[A-Za-z0-9._:-]+$ ]] || die "bad model $model"
+  [[ -z $effort || $effort =~ ^[a-z]+$ ]] || die "bad effort $effort"
   acc=$(pick_account "$kind" "$acc")
   s=${s:-$kind-$(date +%H%M%S)}
   # The account is chosen per session: its credentials go into the box only now, and only that
@@ -597,6 +613,11 @@ agent_run() {
       in_box "$b" "h=~/.lxs/codex/$acc; mkdir -p \$h && ln -sf ~/.codex/config.toml \$h/config.toml && ln -sf /mnt/codex/$acc/auth.json \$h/auth.json"
       cmd="export CODEX_HOME=~/.lxs/codex/$acc; codex --dangerously-bypass-approvals-and-sandbox" ;;
   esac
+  if [ "$kind" = claude ]; then
+    [ -n "$model" ] && cmd+=" --model $model"; [ -n "$effort" ] && cmd+=" --effort $effort"
+  else
+    [ -n "$model" ] && cmd+=" -m $model"; [ -n "$effort" ] && cmd+=" -c model_reasoning_effort=$effort"
+  fi
   # --continue picks up the last conversation in the box (claude --continue, codex resume --last)
   if [ -n "$cont" ]; then [ "$kind" = claude ] && cmd+=" --continue" || cmd=${cmd/codex /codex resume --last }; fi
   # --remote-control: drive the session from claude.ai / the Claude app, named <box>/<session>

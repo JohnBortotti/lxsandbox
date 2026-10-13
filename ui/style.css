@@ -115,6 +115,9 @@ code, pre, .mono { font-family: var(--mono); letter-spacing: 0; }
   margin: 20px 0 4px; padding: 0 10px; height: 24px;
   font: 500 11px var(--mono); text-transform: uppercase; letter-spacing: 0.08em; color: var(--muted-foreground);
 }
+.sec-label .tools { display: flex; gap: 2px; }
+.btn.icon.spin svg { animation: spin .6s linear infinite; }
+@keyframes spin { to { transform: rotate(360deg); } }
 .sec-label.sub { margin-top: 10px; font-size: 10px; color: var(--faint); }
 .side-foot { flex-shrink: 0; border-top: 1px solid var(--border); padding: 10px 12px 12px; display: grid; gap: 3px; }
 .side-foot .kv { display: flex; justify-content: space-between; gap: 8px; font: 11px var(--mono); color: var(--muted-foreground); font-variant-numeric: tabular-nums; }

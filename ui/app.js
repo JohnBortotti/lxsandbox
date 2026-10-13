@@ -352,6 +352,14 @@ function openNewBox() {
   d.showModal(); f.box.focus();
 }
 $("#newBoxBtn").addEventListener("click", openNewBox);
+$("#refreshBtn").addEventListener("click", async (e) => {
+  const btn = e.currentTarget; if (btn.classList.contains("spin")) return;
+  btn.classList.add("spin");
+  try {
+    await refresh();
+    if (view.tab === "logs") await loadLogs(); else if (view.tab === "diff") await loadDiff();
+  } finally { setTimeout(() => btn.classList.remove("spin"), 400); }
+});
 $("#newBoxForm").addEventListener("submit", async (e) => {
   e.preventDefault();
   const f = e.target, out = $(".job", f), btn = $("button[type=submit]", f);
