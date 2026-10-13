@@ -25,7 +25,7 @@ LXS = os.environ.get("LXS_BIN") or os.path.join(HERE, "lxsandbox")
 STATIC = os.path.join(HERE, "ui")
 BOX = re.compile(r"^[a-z][a-z0-9-]*$")
 NAME = re.compile(r"^[A-Za-z0-9_.-]+$")
-TYPES = {".html": "text/html; charset=utf-8", ".js": "text/javascript", ".css": "text/css",
+TYPES = {".html": "text/html; charset=utf-8", ".woff2": "font/woff2", ".js": "text/javascript", ".css": "text/css",
          ".svg": "image/svg+xml", ".png": "image/png"}
 WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 
