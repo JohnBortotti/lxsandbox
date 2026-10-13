@@ -202,32 +202,20 @@ function renderSessions(b) {
         <div class="head"><span class="sname"></span><span class="st"></span><span class="info"></span>
           <span class="acts"><button class="btn xs ghost danger" data-a="kill" title="End session">End</button></span></div>
         <div class="reply hidden"></div>
-        <form class="send"><textarea rows="1" placeholder="Message ${esc(s.session)}"></textarea>
-          <button class="btn sm primary" type="submit">Send</button></form>
       </div>`);
       el.querySelector(".sname").textContent = s.session;
       el.addEventListener("click", (e) => {
         const a = e.target.closest("[data-a]")?.dataset.a;
-        if (!a && e.target.closest(".head") && s.session !== view.session) go(view.box, view.tab === "diff" ? "term" : view.tab, s.session);
         if (a === "kill" && confirm(`End session ${s.session}? The agent stops; the box and its files stay.`))
-          act({ op: "kill", box: view.box, session: s.session }, `Ended ${s.session}`);
-        if (e.target.closest(".reply")) e.target.closest(".reply").classList.add("open");
-      });
-      const ta = el.querySelector("textarea");
-      ta.addEventListener("keydown", (e) => { if (e.key === "Enter" && !e.shiftKey && !e.isComposing) { e.preventDefault(); el.querySelector("form").requestSubmit(); } });
-      ta.addEventListener("input", () => { ta.style.height = "32px"; ta.style.height = Math.min(ta.scrollHeight, 200) + "px"; ta.style.overflow = ta.scrollHeight > 200 ? "auto" : "hidden"; });
-      el.querySelector("form").addEventListener("submit", async (e) => {
-        e.preventDefault();
-        const text = ta.value; if (!text.trim()) return;
-        ta.disabled = true;
-        try { await act({ op: "send", box: view.box, session: s.session, text }, `Sent to ${s.session}`); ta.value = ""; ta.style.height = "32px"; }
-        finally { ta.disabled = false; ta.focus(); }
+          return act({ op: "kill", box: view.box, session: s.session }, `Ended ${s.session}`);
+        const r = e.target.closest(".reply.clip:not(.open)");
+        if (r) return r.classList.add("open");
+        if (!a && !getSelection().toString() && (s.session !== view.session || view.tab !== "term")) go(view.box, "term", s.session);
       });
       wrap.append(el);
     }
-    el.classList.toggle("selected", ss.length > 1 && s.session === view.session);
+    el.classList.toggle("selected", ss.length > 1 && view.tab === "term" && s.session === view.session);
     el.querySelector(".st").innerHTML = stateBadge(s);
-    el.classList.toggle("pickable", ss.length > 1);
     el.querySelector(".info").textContent = s.since ? `${s.state === "working" ? "for" : "since"} ${ago(s.since)}` : "";
     const r = el.querySelector(".reply");
     if (s.message && s.state !== "working") {
