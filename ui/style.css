@@ -229,11 +229,13 @@ td a:hover { text-decoration-color: var(--foreground); }
 /* ---------- sessions ---------- */
 .sess { padding: 14px 16px; display: grid; gap: 10px; }
 .stack > .sess + .sess { border-top: 1px solid var(--border); }
-.sess.selected { background: color-mix(in srgb, var(--muted) 70%, transparent); }
+.sess.selected { background: color-mix(in srgb, var(--muted) 70%, transparent); box-shadow: inset 2px 0 0 var(--foreground); }
 .sess .head { display: flex; align-items: center; gap: 12px; min-width: 0; }
 .sess .head .sname { font: 500 13.5px var(--mono); letter-spacing: 0; }
 .sess .head .info { font: 12px var(--mono); color: var(--muted-foreground); letter-spacing: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.sess .head .acts { display: flex; gap: 2px; margin-left: auto; }
+.sess .head .acts { display: flex; gap: 2px; margin-left: auto; transition: opacity .15s; }
+@media (hover: hover) { .sess .head .acts { opacity: 0; } .sess:hover .head .acts, .sess .head .acts:focus-within { opacity: 1; } }
+.sess.pickable .head { cursor: pointer; }
 .reply {
   font-size: 13.5px; line-height: 1.55; white-space: pre-wrap; word-break: break-word;
   padding-left: 12px; border-left: 2px solid var(--border); color: var(--foreground);

@@ -200,8 +200,7 @@ function renderSessions(b) {
     if (!el) {
       el = h(`<div class="sess" data-s="${esc(s.session)}">
         <div class="head"><span class="sname"></span><span class="st"></span><span class="info"></span>
-          <span class="acts"><button class="btn xs ghost" data-a="term">Terminal</button><button class="btn xs ghost" data-a="logs">Logs</button>
-          <button class="btn xs ghost danger" data-a="kill">End</button></span></div>
+          <span class="acts"><button class="btn xs ghost danger" data-a="kill" title="End session">End</button></span></div>
         <div class="reply hidden"></div>
         <form class="send"><textarea rows="1" placeholder="Message ${esc(s.session)}"></textarea>
           <button class="btn sm primary" type="submit">Send</button></form>
@@ -209,7 +208,7 @@ function renderSessions(b) {
       el.querySelector(".sname").textContent = s.session;
       el.addEventListener("click", (e) => {
         const a = e.target.closest("[data-a]")?.dataset.a;
-        if (a === "term" || a === "logs") go(view.box, a, s.session);
+        if (!a && e.target.closest(".head") && s.session !== view.session) go(view.box, view.tab === "diff" ? "term" : view.tab, s.session);
         if (a === "kill" && confirm(`End session ${s.session}? The agent stops; the box and its files stay.`))
           act({ op: "kill", box: view.box, session: s.session }, `Ended ${s.session}`);
         if (e.target.closest(".reply")) e.target.closest(".reply").classList.add("open");
@@ -228,8 +227,8 @@ function renderSessions(b) {
     }
     el.classList.toggle("selected", ss.length > 1 && s.session === view.session);
     el.querySelector(".st").innerHTML = stateBadge(s);
-    el.querySelector(".info").textContent = [s.since && `${s.state === "working" ? "for" : "since"} ${ago(s.since)}`, s.running,
-      s.attached ? "attached" : ""].filter(Boolean).join(" · ");
+    el.classList.toggle("pickable", ss.length > 1);
+    el.querySelector(".info").textContent = s.since ? `${s.state === "working" ? "for" : "since"} ${ago(s.since)}` : "";
     const r = el.querySelector(".reply");
     if (s.message && s.state !== "working") {
       if (r.textContent !== s.message) r.textContent = s.message;
@@ -243,10 +242,9 @@ function renderSessions(b) {
 function renderTabs() {
   const ss = curBox()?.sessions || [];
   const tab = (id, label) => `<button class="tab ${view.tab === id ? "active" : ""}" onclick="go(view.box, '${id}')">${label}</button>`;
-  const pick = view.tab !== "diff" && ss.length > 1 ? `<select onchange="go(view.box, view.tab, this.value)">
-      ${ss.map((s) => `<option ${s.session === view.session ? "selected" : ""}>${esc(s.session)}</option>`).join("")}</select>` : "";
-  const right = view.tab === "term" && view.session ? `${pick}<span>tmux · ${esc(view.session)}</span>`
-    : view.tab === "logs" && view.session ? `${pick}<button class="btn xs" onclick="loadLogs()">Refresh</button>`
+  const who = view.tab !== "diff" && view.session && ss.length > 1 ? `<span>${esc(view.session)}</span>` : "";
+  const right = view.tab === "term" ? who
+    : view.tab === "logs" && view.session ? `${who}<button class="btn xs" onclick="loadLogs()">Refresh</button>`
     : view.tab === "diff" ? `<button class="btn xs" onclick="loadDiff()">Refresh</button>` : "";
   $("#tabs").innerHTML = tab("term", "Terminal") + tab("logs", "Logs") + tab("diff", "Changes") + `<div class="right">${right}</div>`;
 }
