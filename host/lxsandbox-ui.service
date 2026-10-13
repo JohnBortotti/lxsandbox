@@ -1,0 +1,13 @@
+# Optional: keep the web UI running (lxs ui).
+#   cp host/lxsandbox-ui.service ~/.config/systemd/user/   # edit the path below first
+#   systemctl --user enable --now lxsandbox-ui; loginctl enable-linger "$USER"
+#   journalctl --user -u lxsandbox-ui | grep token         # the login URL
+[Unit]
+Description=lxsandbox web UI
+
+[Service]
+ExecStart=%h/lxsandbox/lxsandbox ui
+Restart=on-failure
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,396 @@
+#!/usr/bin/env python3
+"""lxsandbox web UI, started with `lxs ui`.
+
+One page over the lxs CLI: boxes and their sessions with live state, the agent's last reply, logs,
+sending prompts, a live terminal on each tmux session, starting agents, per-repo diffs and PRs, and
+creating, starting, stopping and deleting boxes. Every action runs the lxs command it stands for, so
+the CLI's guards (like `lxs rm` refusing unsaved work) apply here too. Python stdlib only.
+
+It listens on 127.0.0.1 by default. To reach it from other machines, put something with TLS in front
+(e.g. `tailscale serve`) rather than --listen 0.0.0.0. Open the URL it prints once: the token then
+lives in a cookie. API calls need that cookie, plus an X-Lxs header on POSTs and a same-origin
+WebSocket, so other web pages can't drive it from your browser.
+
+Files under $LXSANDBOX_HOME (default ~/.lxsandbox):
+  ui.token   the login token, created on first start (delete it to rotate)
+"""
+import argparse, base64, fcntl, hashlib, hmac, http.server, itertools, json, os, pty, re, secrets
+import signal, struct, subprocess, termios, threading, time, uuid
+from http.cookies import SimpleCookie
+from urllib.parse import parse_qs, urlsplit
+
+HOME = os.environ.get("LXSANDBOX_HOME") or os.path.expanduser("~/.lxsandbox")
+HERE = os.path.dirname(os.path.realpath(__file__))
+LXS = os.environ.get("LXS_BIN") or os.path.join(HERE, "lxsandbox")
+STATIC = os.path.join(HERE, "ui")
+BOX = re.compile(r"^[a-z][a-z0-9-]*$")
+NAME = re.compile(r"^[A-Za-z0-9_.-]+$")
+TYPES = {".html": "text/html; charset=utf-8", ".js": "text/javascript", ".css": "text/css",
+         ".svg": "image/svg+xml", ".png": "image/png"}
+WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+
+
+def token():
+    f = os.path.join(HOME, "ui.token")
+    if not os.path.exists(f):
+        old = os.umask(0o077)
+        with open(f, "w") as fh:
+            fh.write(secrets.token_urlsafe(24) + "\n")
+        os.umask(old)
+    return open(f).read().strip()
+
+
+def lxs(*args, timeout=180):
+    """Run lxs; return (rc, stdout, stderr)."""
+    try:
+        p = subprocess.run([LXS, *args], capture_output=True, text=True, timeout=timeout,
+                           stdin=subprocess.DEVNULL, env={**os.environ, "NO_COLOR": "1"})
+        return p.returncode, p.stdout, p.stderr
+    except subprocess.TimeoutExpired:
+        return 124, "", f"lxs {args[0]} timed out after {timeout}s"
+
+
+class Cache:
+    """The state call fans out into the boxes, so concurrent polls share one run."""
+    def __init__(self, ttl):
+        self.ttl, self.at, self.val, self.lock = ttl, 0.0, None, threading.Lock()
+
+    def get(self, fn):
+        with self.lock:
+            if self.val is None or time.time() - self.at > self.ttl:
+                self.val, self.at = fn(), time.time()
+            return self.val
+
+    def drop(self):
+        self.at = 0.0
+
+
+def state():
+    rc, out, err = lxs("status", "--json", timeout=60)
+    if rc:
+        return {"error": err.strip() or "lxs status failed"}
+    st = json.loads(out)
+
+    def ps(b):
+        rc, out, _ = lxs("ps", b["box"], "--json", timeout=30)
+        b["sessions"] = json.loads(out) if rc == 0 and out.strip() else []
+    running = [b for b in st["boxes"] if b["state"] == "RUNNING"]
+    for b in st["boxes"]:
+        b["sessions"] = [{"session": s, "state": "unknown"} for s in b.get("sessions", [])]
+    ts = [threading.Thread(target=ps, args=(b,)) for b in running]
+    for t in ts:
+        t.start()
+    for t in ts:
+        t.join()
+    st["time"] = time.strftime("%Y-%m-%d %H:%M:%S")
+    z = time.strftime("%z")  # lxs prints local times; the browser may sit in another zone
+    st["tz"] = z[:3] + ":" + z[3:]
+    return st
+
+
+STATE = Cache(2.0)
+JOBS = {}
+
+
+def job(args):
+    """Long commands (lxs new) run in the background; the page polls their output."""
+    jid = uuid.uuid4().hex[:12]
+    j = JOBS[jid] = {"cmd": "lxs " + " ".join(args), "out": "", "done": False, "rc": None}
+
+    def run():
+        p = subprocess.Popen([LXS, *args], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                             stdin=subprocess.DEVNULL, env={**os.environ, "NO_COLOR": "1"})
+        for line in p.stdout:
+            j["out"] += line
+        j["rc"], j["done"] = p.wait(), True
+        STATE.drop()
+    threading.Thread(target=run, daemon=True).start()
+    return jid
+
+
+# ---------- websocket (RFC 6455, just enough for a terminal) ----------
+def ws_recv(rfile):
+    msg, first = b"", None
+    while True:
+        h = rfile.read(2)
+        if len(h) < 2:
+            return None, None
+        fin, op, n = h[0] & 0x80, h[0] & 0x0F, h[1] & 0x7F
+        if n == 126:
+            n = struct.unpack(">H", rfile.read(2))[0]
+        elif n == 127:
+            n = struct.unpack(">Q", rfile.read(8))[0]
+        mask = rfile.read(4) if h[1] & 0x80 else b""
+        data = rfile.read(n)
+        if mask:
+            data = bytes(a ^ b for a, b in zip(data, itertools.cycle(mask)))
+        if op >= 8:  # control frames may come between fragments
+            return op, data
+        first = first if first is not None else op
+        msg += data
+        if fin:
+            return first, msg
+
+
+def ws_send(sock, lock, op, data):
+    n = len(data)
+    head = bytes([0x80 | op]) + (bytes([n]) if n < 126 else
+                                 bytes([126]) + struct.pack(">H", n) if n < 65536 else
+                                 bytes([127]) + struct.pack(">Q", n))
+    with lock:
+        sock.sendall(head + data)
+
+
+def winsize(fd, cols, rows):
+    fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", max(rows, 2), max(cols, 10), 0, 0))
+
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    server_version = "lxsandbox-ui"
+    protocol_version = "HTTP/1.1"
+
+    def log_message(self, fmt, *args):
+        pass
+
+    # ---------- plumbing ----------
+    def send(self, code, body=b"", ctype="application/json", headers=()):
+        if isinstance(body, (dict, list)):
+            body = json.dumps(body).encode()
+        elif isinstance(body, str):
+            body = body.encode()
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Referrer-Policy", "no-referrer")
+        for k, v in headers:
+            self.send_header(k, v)
+        self.end_headers()
+        self.wfile.write(body)
+
+    def authed(self):
+        c = SimpleCookie(self.headers.get("Cookie", ""))
+        return "lxs_ui" in c and hmac.compare_digest(c["lxs_ui"].value, self.server.token)
+
+    def same_origin(self):
+        o = self.headers.get("Origin")
+        return o is None or urlsplit(o).netloc == self.headers.get("Host")
+
+    def body(self):
+        n = int(self.headers.get("Content-Length") or 0)
+        return json.loads(self.rfile.read(n) or b"{}") if n else {}
+
+    # ---------- routes ----------
+    def do_GET(self):
+        u = urlsplit(self.path)
+        qs = {k: v[0] for k, v in parse_qs(u.query).items()}
+        if u.path.startswith("/static/"):
+            return self.static(u.path[len("/static/"):])
+        if u.path == "/":
+            if "token" in qs:  # first visit from the printed URL: trade it for a cookie
+                if not hmac.compare_digest(qs["token"], self.server.token):
+                    return self.send(403, "bad token", "text/plain")
+                return self.send(303, b"", "text/plain", [("Location", "/"), (
+                    "Set-Cookie", f"lxs_ui={self.server.token}; Path=/; HttpOnly; SameSite=Strict; Max-Age=31536000")])
+            if not self.authed():
+                return self.send(401, LOCKED, "text/html; charset=utf-8")
+            return self.static("index.html")
+        if not self.authed():
+            return self.send(401, {"error": "not logged in"})
+        try:
+            if u.path == "/api/state":
+                return self.send(200, STATE.get(state))
+            if u.path == "/api/logs":
+                return self.cli("logs", self.box(qs), self.sess(qs), "-n", str(min(int(qs.get("n", 200)), 5000)), text=True)
+            if u.path == "/api/diff":
+                return self.cli("diff", self.box(qs), "--json", timeout=60)
+            if u.path == "/api/patch":
+                repo = qs.get("repo", "")
+                if not NAME.match(repo):
+                    raise ValueError("bad repo")
+                return self.cli("diff", self.box(qs), repo, text=True, timeout=60)
+            if u.path == "/api/job":
+                j = JOBS.get(qs.get("id", ""))
+                return self.send(200, j) if j else self.send(404, {"error": "no such job"})
+            if u.path == "/api/term":
+                return self.term(self.box(qs), self.sess(qs), int(qs.get("cols", 120)), int(qs.get("rows", 40)))
+        except ValueError as e:
+            return self.send(400, {"error": str(e)})
+        self.send(404, {"error": "not found"})
+
+    def do_POST(self):
+        if not self.authed():
+            return self.send(401, {"error": "not logged in"})
+        if self.headers.get("X-Lxs") != "1" or not self.same_origin():
+            return self.send(403, {"error": "cross-site request refused"})
+        try:
+            d = self.body()
+            op = d.get("op")
+            if op == "new":
+                b = self.box(d)
+                env = d.get("env", "")
+                if not NAME.match(env):
+                    raise ValueError("pick an env")
+                args = ["new", b, "--env", env]
+                for r in d.get("repos", []):
+                    r = r.strip()
+                    if r:
+                        if r.startswith("-"):
+                            raise ValueError(f"bad repo: {r}")
+                        args += ["--repo", r]
+                return self.send(200, {"job": job(args)})
+            b = self.box(d)
+            if op == "run":
+                agent = d.get("agent")
+                if agent not in ("claude", "codex"):
+                    raise ValueError("agent is claude or codex")
+                args = ["run", b, agent]
+                if d.get("account"):
+                    args += ["--account", self.name(d["account"])]
+                if d.get("name"):
+                    args += ["--name", self.name(d["name"])]
+                if d.get("continue"):
+                    args.append("--continue")
+                if d.get("prompt", "").strip():
+                    args.append(d["prompt"])
+                return self.cli(*args, drop=True)
+            if op == "send":
+                text = d.get("text", "")
+                if not text.strip():
+                    raise ValueError("empty message")
+                return self.cli("send", b, self.sess(d), text, drop=True)
+            if op == "kill":
+                return self.cli("kill", b, self.sess(d), drop=True)
+            if op in ("start", "stop"):
+                return self.cli(op, b, drop=True)
+            if op == "rm":
+                return self.cli("rm", b, *(["--force"] if d.get("force") else []), drop=True)
+        except ValueError as e:
+            return self.send(400, {"error": str(e)})
+        self.send(400, {"error": "unknown op"})
+
+    def box(self, d):
+        b = d.get("box", "")
+        if not BOX.match(b):
+            raise ValueError("bad box name")
+        return b
+
+    def name(self, s):
+        if not NAME.match(s):
+            raise ValueError(f"bad name: {s}")
+        return s
+
+    def sess(self, d):
+        return self.name(d.get("s") or d.get("session") or "")
+
+    def cli(self, *args, text=False, drop=False, timeout=180):
+        rc, out, err = lxs(*args, timeout=timeout)
+        if drop:
+            STATE.drop()
+        if rc:
+            return self.send(400, {"error": (err or out).strip() or f"lxs {args[0]} failed (exit {rc})", "rc": rc})
+        if text:
+            return self.send(200, out, "text/plain; charset=utf-8")
+        try:
+            return self.send(200, json.loads(out) if out.strip() else {})
+        except json.JSONDecodeError:
+            return self.send(200, {"output": out})
+
+    def static(self, rel):
+        f = os.path.realpath(os.path.join(STATIC, rel))
+        if not f.startswith(STATIC + os.sep) or not os.path.isfile(f):
+            return self.send(404, "not found", "text/plain")
+        cache = "max-age=86400" if "/vendor/" in f else "no-cache"
+        with open(f, "rb") as fh:
+            self.send(200, fh.read(), TYPES.get(os.path.splitext(f)[1], "application/octet-stream"),
+                      [("Cache-Control", cache)])
+
+    # ---------- live terminal: `lxs attach` on a pty, bridged to a websocket ----------
+    def term(self, b, s, cols, rows):
+        if self.headers.get("Upgrade", "").lower() != "websocket" or not self.same_origin():
+            return self.send(400, {"error": "websocket only, same origin"})
+        key = self.headers.get("Sec-WebSocket-Key", "")
+        self.send_response(101)
+        self.send_header("Upgrade", "websocket")
+        self.send_header("Connection", "Upgrade")
+        self.send_header("Sec-WebSocket-Accept",
+                         base64.b64encode(hashlib.sha1((key + WS_GUID).encode()).digest()).decode())
+        self.end_headers()
+        self.wfile.flush()
+        self.close_connection = True
+        sock, lock = self.connection, threading.Lock()
+
+        fd, slave = pty.openpty()
+        winsize(slave, cols, rows)
+        proc = subprocess.Popen([LXS, "attach", b, s], stdin=slave, stdout=slave, stderr=slave,
+                                start_new_session=True, env={**os.environ, "TERM": "xterm-256color"})
+        os.close(slave)
+        print(f"terminal {b}/{s}: attached", flush=True)
+
+        def pump():  # pty -> browser
+            try:
+                while True:
+                    data = os.read(fd, 65536)
+                    if not data:
+                        break
+                    ws_send(sock, lock, 2, data)
+            except OSError:
+                pass
+            try:
+                ws_send(sock, lock, 8, struct.pack(">H", 1000))
+            except OSError:
+                pass
+        t = threading.Thread(target=pump, daemon=True)
+        t.start()
+        try:  # browser -> pty: "0<input>" or "1{"cols":..,"rows":..}"
+            while True:
+                op, data = ws_recv(self.rfile)
+                if op is None or op == 8:
+                    break
+                if op == 9:
+                    ws_send(sock, lock, 10, data)
+                elif op in (1, 2) and data:
+                    if data[:1] == b"0":
+                        os.write(fd, data[1:])
+                    elif data[:1] == b"1":
+                        sz = json.loads(data[1:])
+                        winsize(fd, int(sz["cols"]), int(sz["rows"]))
+                        proc.send_signal(signal.SIGWINCH)  # no controlling tty, so say it ourselves
+        except (OSError, ValueError):
+            pass
+        finally:  # hanging up the attach detaches the tmux client; the session keeps running
+            try:
+                os.killpg(proc.pid, signal.SIGHUP)
+            except OSError:
+                pass
+            try:
+                proc.wait(3)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+            os.close(fd)
+            print(f"terminal {b}/{s}: detached (attach exit {proc.returncode})", flush=True)
+
+
+LOCKED = """<!doctype html><meta charset=utf-8><title>lxsandbox</title>
+<body style="font:14px system-ui;display:grid;place-items:center;height:90vh;color:#666">
+<div>Open the URL that <code>lxs ui</code> printed (it carries the login token).</div>"""
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="lxs ui", description="lxsandbox web UI")
+    ap.add_argument("--port", type=int, default=4791)
+    ap.add_argument("--listen", default="127.0.0.1")
+    a = ap.parse_args()
+    srv = http.server.ThreadingHTTPServer((a.listen, a.port), Handler)
+    srv.daemon_threads = True
+    srv.token = token()
+    print(f"lxs ui on http://{a.listen}:{a.port}/?token={srv.token}", flush=True)
+    try:
+        srv.serve_forever()
+    except KeyboardInterrupt:
+        pass
+
+
+if __name__ == "__main__":
+    main()

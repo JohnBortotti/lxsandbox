@@ -86,6 +86,22 @@ and take `--json` for scripts:
     lxs ls --json | jq -r '.[] | select(.state == "RUNNING") | .box'
     lxs env show web --json | jq .allow
 
+`lxs diff <box>` sums up each `/work` repo against its base branch (commits, unpushed, uncommitted,
+open PR); `lxs diff <box> <repo>` prints the patch.
+
+## Web UI (`lxs ui`)
+A small local web page over the same commands: boxes and their sessions (working / idle / needs you, and
+for how long), the last reply, a box to message an agent, a live terminal on its tmux session, logs, the
+changes in `/work` with their diff and PR, and buttons for new box, run agent, start/stop and delete (with
+the same unsaved-work guard as `lxs rm`). It only calls `lxs`; no extra dependencies beyond python3.
+
+    lxs ui                       # http://127.0.0.1:4791/?token=...
+
+The URL it prints carries a token (kept in `~/.lxsandbox/ui.token`; delete the file and restart to
+rotate it), which the page trades for a cookie. It listens on localhost only; to reach it from other
+machines put an authenticated proxy in front, e.g. `tailscale serve --bg --https=8444 http://127.0.0.1:4791`.
+`host/lxsandbox-ui.service` keeps it running.
+
 ## MCP servers (`--mcp HOOK[:SCOPE]`)
 A hook is an executable in `~/.lxsandbox/hooks/` that mints a credential per box and revokes it when the
 box is deleted, so every box has its own revocable token. See `examples/mcp-hook`. The server is
@@ -101,7 +117,8 @@ That is weaker isolation than a VM. Anything given to a box (Claude token, MCP t
 the gh token, use of the ssh-agent) is usable by the agents in it, and by anything that prompt-injects
 them. With `EGRESS=allowlist` a box can only talk to the hosts you allowed, but an allowed host can still
 receive data (e.g. a gist on github.com). `EGRESS=open` boxes reach everything the host reaches, including
-your LAN and tailnet. Give each env only what it needs.
+your LAN and tailnet. Give each env only what it needs. The web UI can run commands in every box, so
+treat its URL like a shell login.
 
 ## TODO
 - VM boxes (`lxc launch --vm`) where hardware virtualization is available.

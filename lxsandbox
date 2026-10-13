@@ -62,7 +62,7 @@ in_box() { local b=$1; shift
 
 usage() { cat <<'U'
 lxs status                          overview: golden image, egress proxy, accounts, envs, boxes
-                                    (status, ls, ps, env ls|show, egress show|log, account ls take --json)
+                                    (status, ls, ps, diff, env ls|show, egress show|log, account ls take --json)
 
 lxs image build                     create/provision the golden container and snapshot it
 lxs image refresh-cli               copy the host's claude + codex binaries into golden
@@ -76,6 +76,7 @@ lxs env ls | show <env> | edit <env> [env.conf|secrets.env|setup.sh] | rm <env>
 
 lxs new <box> --env <env> [--repo R]...   R = a local path, ~/workspace/<dir>, owner/name or a git url
 lxs ls | shell <box> | snap <box> [name] | stop <box> | start <box>
+lxs diff <box> [repo]               per repo: branch, commits, unsaved work, PR; with a repo, its patch
 lxs rm <box> [--force]              refuses if a /work repo has unpushed or uncommitted work
 lxs prune [--yes]                   list (or delete) idle boxes with nothing unsaved
 
@@ -97,6 +98,8 @@ lxs logs <box> [S] [-n N]           last N lines of the session screen (default 
 lxs attach <box> [S]                attach your terminal to a session
 lxs kill <box> [S]                  end a session
                                     (S may be left out when the box has only one session)
+
+lxs ui [--port P] [--listen ADDR]   web UI (default 127.0.0.1:4791): boxes, sessions, live terminals
 U
 }
 
@@ -482,11 +485,13 @@ boxes_json() { # boxes_json [with_sessions=1]: one lxc query, plus a tmux look i
   done | jq -sc .
 }
 box_ls() { show "$(boxes_json)" "no boxes (lxs new <box> --env <env>)" '{box, state, env, egress, sessions, created}'; }
-box_ps() {
+box_ps() { # the status file (lxs-status) gives state, since and the last reply; --json has the reply
   show "$(in_box "${1:?box}" "tmux ls -F '#S	#{session_created}	#{session_attached}	#{pane_current_command}' 2>/dev/null |
-      while IFS=\$'\\t' read -r s c a p; do printf '%s\\t%s\\t%s\\t%s\\t%s\\n' \"\$s\" \"\$(jq -r .state ~/.lxs/status/\$s 2>/dev/null || echo unknown)\" \"\$c\" \"\$a\" \"\$p\"; done" \
-    | jq -Rnc '[inputs | split("\t") | {session: .[0], state: .[1], started: (.[2] | tonumber | strflocaltime("%Y-%m-%d %H:%M")),
-                attached: (.[3] != "0"), running: .[4]}]')" "(no sessions)"
+      while IFS=\$'\\t' read -r s c a p; do printf '%s\\t%s\\t%s\\t%s\\t%s\\n' \"\$s\" \"\$c\" \"\$a\" \"\$p\" \"\$(jq -c . ~/.lxs/status/\$s 2>/dev/null || echo '{}')\"; done" \
+    | jq -Rnc '[inputs | split("\t") | (.[4] | fromjson? // {}) as $st | {session: .[0], state: ($st.state // "unknown"),
+                since: (if $st.since then ($st.since | strflocaltime("%Y-%m-%d %H:%M:%S")) else null end),
+                started: (.[1] | tonumber | strflocaltime("%Y-%m-%d %H:%M")), attached: (.[2] != "0"), running: .[3],
+                message: ($st.message // "")}]')" "(no sessions)" '{session, state, since, started, attached, running}'
 }
 status() {
   local up=down pid; pid=$(cat "$LXSANDBOX_HOME/egress.pid" 2>/dev/null || true)
@@ -503,6 +508,28 @@ status() {
   title Accounts; account ls
   title Envs; env_cmd ls
   title Boxes; box_ls
+}
+
+# ---------- diff: what a box changed, per repo, against the branch it started from ----------
+# base = merge-base with origin/HEAD (the remote's default branch when the repo was cloned)
+BASE_SH='base=$(git merge-base HEAD "$(git symbolic-ref -q --short refs/remotes/origin/HEAD || echo origin/main)" 2>/dev/null \
+  || git merge-base HEAD origin/master 2>/dev/null || git rev-parse HEAD)'
+box_diff() { # box_diff <box> [repo]: a summary per repo; with a repo, its patch (committed + uncommitted)
+  local b=${1:?box} r=${2:-}; is_box "$b" || die "no box $b"
+  if [ -n "$r" ]; then
+    [[ $r =~ ^[A-Za-z0-9._-]+$ ]] || die "bad repo name: $r"
+    in_box "$b" "cd /work/$(q "$r") 2>/dev/null || { echo 'lxs: no repo /work/$r' >&2; exit 1; }; $BASE_SH"'
+      git diff "$base"; git ls-files --others --exclude-standard | sed "s/^/untracked: /"'
+    return
+  fi
+  show "$(in_box "$b" 'for r in /work/*/; do [ -d "$r/.git" ] || continue; cd "$r"; '"$BASE_SH"'
+      jq -nc --arg repo "$(basename "$r")" --arg branch "$(git rev-parse --abbrev-ref HEAD)" \
+        --arg commits "$(git rev-list --count "$base"..HEAD)" --arg unpushed "$(git log --branches --not --remotes --oneline | wc -l)" \
+        --arg uncommitted "$(git status --porcelain | wc -l)" --arg changes "$(git diff --shortstat "$base")" \
+        --arg pr "$(timeout 15 gh pr view --json url -q .url 2>/dev/null || true)" \
+        "{repo: \$repo, branch: \$branch, commits: (\$commits | tonumber), unpushed: (\$unpushed | tonumber),
+          uncommitted: (\$uncommitted | tonumber), changes: (\$changes | sub(\"^ \"; \"\")), pr: \$pr}"
+    done' | jq -sc .)" "(no repos in /work)"
 }
 
 # ---------- deleting: never lose unpushed work by accident ----------
@@ -627,7 +654,7 @@ pick_session() { # the named session, or the box's only one; with several, say w
   esac; }
 
 cmd=${1:-help}; shift || true
-case "$cmd" in ls|env|egress|account|ps|status|st|wait) # --json anywhere in the args
+case "$cmd" in ls|env|egress|account|ps|status|st|wait|diff) # --json anywhere in the args
   args=(); for a in "$@"; do if [ "$a" = --json ]; then JSON=1; else args+=("$a"); fi; done
   set -- ${args[@]+"${args[@]}"} ;; esac
 case "$cmd" in
@@ -646,6 +673,8 @@ case "$cmd" in
   snap) lxc snapshot "${1:?box}" ${2:+"$2"} ;;
   run) agent_run "$@" ;;
   ps) box_ps "$@" ;;
+  diff) box_diff "$@" ;;
+  ui) LXS_BIN="$SRC/lxsandbox" exec python3 "$SRC/lxsandbox-ui" "$@" ;;
   send) [ $# -ge 3 ] && agent_send "$1" "$2" "$3" || agent_send "${1:?box}" "$(pick_session "$1")" "${2:?text}" ;;
   logs) agent_logs "$@" ;;
   wait) b=${1:?box}; shift; s=""; [ $# -gt 0 ] && [[ $1 != --* ]] && { s=$1; shift; }

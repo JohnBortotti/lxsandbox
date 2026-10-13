@@ -1,0 +1,79 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>lxsandbox</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect x='1.5' y='1.5' width='13' height='13' rx='3' fill='none' stroke='%23888' stroke-width='1.5'/%3E%3Crect x='5' y='5' width='6' height='6' rx='1' fill='%23888'/%3E%3C/svg%3E">
+  <link rel="stylesheet" href="/static/vendor/xterm.css">
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <div class="app">
+    <aside class="side">
+      <a class="brand" href="#/"><span class="logo"></span>lxsandbox</a>
+      <button class="btn primary block" id="newBoxBtn">New box</button>
+      <div class="side-label">Boxes</div>
+      <nav id="boxList" class="box-list"></nav>
+      <div class="side-foot" id="sysInfo"></div>
+    </aside>
+    <main id="main"></main>
+  </div>
+
+  <dialog id="newBoxDlg">
+    <form method="dialog" id="newBoxForm">
+      <h3>New box</h3>
+      <label>Name<input name="box" required pattern="[a-z][a-z0-9-]*" placeholder="w1" autocomplete="off"></label>
+      <label>Env<select name="env" required></select></label>
+      <label>Repos <span class="hint">one per line: owner/name, a git url, or a dir in ~/workspace</span>
+        <textarea name="repos" rows="3" placeholder="owner/api"></textarea></label>
+      <pre class="job hidden"></pre>
+      <div class="actions">
+        <button type="button" class="btn" value="cancel" data-close>Cancel</button>
+        <button type="submit" class="btn primary">Create</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog id="runDlg">
+    <form method="dialog" id="runForm">
+      <h3>Run an agent in <span class="mono" data-box></span></h3>
+      <div class="seg" role="radiogroup">
+        <label><input type="radio" name="agent" value="claude" checked><span>Claude Code</span></label>
+        <label><input type="radio" name="agent" value="codex"><span>Codex</span></label>
+      </div>
+      <div class="two">
+        <label>Account<select name="account"></select></label>
+        <label>Session name<input name="name" pattern="[A-Za-z0-9_.-]+" placeholder="main" autocomplete="off"></label>
+      </div>
+      <label>Prompt <span class="hint">optional; without one the agent waits for input</span>
+        <textarea name="prompt" rows="5"></textarea></label>
+      <label class="check"><input type="checkbox" name="continue"> Continue the box's last conversation</label>
+      <div class="actions">
+        <button type="button" class="btn" data-close>Cancel</button>
+        <button type="submit" class="btn primary">Run</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog id="rmDlg">
+    <form method="dialog" id="rmForm">
+      <h3>Delete <span class="mono" data-box></span>?</h3>
+      <p class="muted">The container and everything in it go away. lxs refuses if a repo in <code>/work</code> has unpushed or uncommitted work.</p>
+      <div class="dirty hidden">
+        <pre></pre>
+        <label>Type the box name to delete it anyway<input name="confirm" autocomplete="off"></label>
+      </div>
+      <div class="actions">
+        <button type="button" class="btn" data-close>Cancel</button>
+        <button type="submit" class="btn danger">Delete</button>
+      </div>
+    </form>
+  </dialog>
+
+  <div id="toasts"></div>
+  <script src="/static/vendor/xterm.js"></script>
+  <script src="/static/vendor/addon-fit.js"></script>
+  <script src="/static/app.js"></script>
+</body>
+</html>
