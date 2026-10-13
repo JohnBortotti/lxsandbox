@@ -115,7 +115,6 @@ code, pre, .mono { font-family: var(--mono); letter-spacing: 0; }
   margin: 20px 0 4px; padding: 0 10px; height: 24px;
   font: 500 11px var(--mono); text-transform: uppercase; letter-spacing: 0.08em; color: var(--muted-foreground);
 }
-.sec-label .tools { display: flex; gap: 2px; }
 .btn.icon.spin svg { animation: spin .6s linear infinite; }
 @keyframes spin { to { transform: rotate(360deg); } }
 .sec-label.sub { margin-top: 10px; font-size: 10px; color: var(--faint); }
@@ -158,6 +157,8 @@ section > .sec-label { margin: 0 0 10px; padding: 0; }
 .btn.sm { height: 28px; padding: 0 10px; font-size: 13px; }
 .btn.xs { height: 24px; padding: 0 8px; font-size: 12px; }
 .btn.icon { width: 24px; height: 24px; padding: 0; }
+.btn.icon.md { width: 32px; height: 32px; }
+.btn.icon.md svg { width: 16px; height: 16px; }
 .btn.block { width: 100%; }
 
 input, select, textarea {

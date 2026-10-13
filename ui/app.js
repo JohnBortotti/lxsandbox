@@ -48,6 +48,14 @@ async function refresh() {
   catch (e) { S = S || { error: e.message, boxes: [], envs: [], accounts: [] }; }
   render();
 }
+const REFRESH = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-9-9c2.52 0 4.93 1 6.74 2.74L21 8"/><path d="M21 3v5h-5"/></svg>`;
+let refreshing = false;
+async function manualRefresh() {
+  if (refreshing) return;
+  refreshing = true; $("#refreshBtn")?.classList.add("spin");
+  try { await refresh(); await new Promise((r) => setTimeout(r, 400)); }
+  finally { refreshing = false; $("#refreshBtn")?.classList.remove("spin"); }
+}
 let pollTimer = null;
 function poll() {
   clearTimeout(pollTimer);
@@ -117,7 +125,7 @@ function renderHome() {
   $("#main").innerHTML = `<div class="page">
     <div class="page-head"><div><h1>Boxes</h1>
       <div class="desc">${plural(boxes.length, "box", "boxes")} · ${count("working")} working · ${need ? `<span class="state waiting"><span class="dot waiting"></span>${need} need you</span>` : "0 need you"} · ${count("idle")} idle</div></div>
-      <div class="actions"><button class="btn primary" onclick="openNewBox()">New Box</button></div></div>
+      <div class="actions"><button class="btn icon md ${refreshing ? "spin" : ""}" id="refreshBtn" onclick="manualRefresh()" title="Refresh" aria-label="Refresh">${REFRESH}</button><button class="btn primary" onclick="openNewBox()">New Box</button></div></div>
     <section>${boxes.length ? `<div class="stack">${boxes.map(boxRow).join("")}</div>`
       : `<div class="empty"><b>No boxes yet</b><p>Create one to give an agent its own sandbox.</p><button class="btn" onclick="openNewBox()">New Box</button></div>`}</section>
     <section><div class="sec-label">Envs</div><div class="stack table-wrap"><table>
@@ -352,14 +360,6 @@ function openNewBox() {
   d.showModal(); f.box.focus();
 }
 $("#newBoxBtn").addEventListener("click", openNewBox);
-$("#refreshBtn").addEventListener("click", async (e) => {
-  const btn = e.currentTarget; if (btn.classList.contains("spin")) return;
-  btn.classList.add("spin");
-  try {
-    await refresh();
-    if (view.tab === "logs") await loadLogs(); else if (view.tab === "diff") await loadDiff();
-  } finally { setTimeout(() => btn.classList.remove("spin"), 400); }
-});
 $("#newBoxForm").addEventListener("submit", async (e) => {
   e.preventDefault();
   const f = e.target, out = $(".job", f), btn = $("button[type=submit]", f);
