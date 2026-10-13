@@ -44,6 +44,10 @@ so `lxs ps` also shows each session as working / idle / waiting. Bots use it ins
 - **Run defaults:** an env's `env.conf` can set `CLAUDE_ACCOUNT`, `CLAUDE_MODEL`, `CLAUDE_EFFORT` (and the
   `CODEX_*` equivalents). `lxs run` uses them when `--account`, `--model` or `--effort` is left out, so
   every box of that env starts its agents the same way.
+- **Baked bases:** `lxs env bake <env>` builds a base for the env's boxes: it clones `BAKE_REPOS`, runs
+  `setup.sh` and `bake.sh` (default: `docker compose pull`/`build` per repo, or `docker build`), then strips
+  repos, tokens and proxy credentials. New boxes copy it instead of golden, so docker images and build cache
+  are already there. Rebake whenever dependencies change; `lxs env unbake <env>` goes back to golden.
 - **Env** (`~/.lxsandbox/envs/<env>/`): `env.conf`, `secrets.env` (exported inside the box), `setup.sh`
   (runs after repos are cloned).
 - **Box:** repos are bundled on the host (so private repos clone with your host credentials) into

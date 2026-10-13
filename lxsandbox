@@ -11,6 +11,7 @@ LXSANDBOX_IMAGE=${LXSANDBOX_IMAGE:-images:debian/trixie/cloud}
 LXSANDBOX_SSH_KEY=${LXSANDBOX_SSH_KEY:-$HOME/.ssh/id_ed25519}
 SRC=$(cd "$(dirname "$(readlink -f "$0")")" && pwd)
 GOLDEN=lxsandbox-golden
+BAKED=lxsandbox-env BAKING=lxsbake  # <prefix>-<env>: an env's baked base, and one being baked
 AGENT_SOCK=$LXSANDBOX_HOME/ssh-agent.sock
 EGRESS_SOCK=$LXSANDBOX_HOME/egress.sock
 mkdir -p "$LXSANDBOX_HOME"/{envs,hooks,egress,accounts/claude,accounts/codex}
@@ -72,7 +73,11 @@ lxs account codex <name>            codex login into its own CODEX_HOME, shared 
 lxs account ls
 
 lxs env new <env> [--mcp HOOK[:SCOPE]] [--no-github] [--egress open]
-lxs env ls | show <env> | edit <env> [env.conf|secrets.env|setup.sh] | rm <env>
+lxs env ls | show <env> | edit <env> [env.conf|secrets.env|setup.sh|bake.sh] | rm <env>
+lxs env bake <env>                  snapshot a base for the env's boxes: BAKE_REPOS cloned, setup.sh + bake.sh
+                                    run (default: docker compose pull/build per repo), then repos and tokens
+                                    removed; boxes keep the docker images and build cache. Rebake any time.
+lxs env unbake <env>                drop it; boxes start from golden again
 
 lxs new <box> --env <env> [--repo R]...   R = a local path, ~/workspace/<dir>, owner/name or a git url
 lxs ls | shell <box> | snap <box> [name] | stop <box> | start <box>
@@ -192,18 +197,23 @@ CLAUDE_EFFORT=
 CODEX_ACCOUNT=
 CODEX_MODEL=
 CODEX_EFFORT=
+BAKE_REPOS=        # repos (owner/name ...) cloned for lxs env bake; boxes then start from the baked snapshot
 C
   ( umask 077; printf '# KEY=value lines, exported inside the box\n' > "$d/secrets.env" )
   printf '#!/usr/bin/env bash\n# runs as agent inside the box after repos are cloned (cwd /work)\n' > "$d/setup.sh"
+  printf '%s\n' '#!/usr/bin/env bash' '# lxs env bake: runs as agent after setup.sh (cwd /work). Empty = for each repo,' \
+    '# docker compose pull + build if it has a compose file, else docker build if it has a Dockerfile.' > "$d/bake.sh"
   egress_default > "$d/egress.allow"
   echo "env $e created: $d"
 }
 allow_list() { [ -f "$1" ] && sed -E 's/#.*//; s/^[[:space:]]+//; s/[[:space:]]+$//; /^$/d' "$1" || true; }
 envs_json() {
-  local d boxes; boxes=$(boxes_json 0)
+  local d boxes names; boxes=$(boxes_json 0); names=$(lxc list -f csv -c n)
   for d in "$LXSANDBOX_HOME"/envs/*/; do [ -f "$d/env.conf" ] || continue
     ( . "$d/env.conf"; e=$(basename "$d")
-      jq -nc --arg env "$e" --arg mcp "${MCP:-}" \
+      baked=""; grep -qx "$BAKED-$e" <<<"$names" && baked=$(lxc config get "$BAKED-$e" user.lxsandbox.baked 2>/dev/null)
+      grep -qx "$BAKING-$e" <<<"$names" && baked=baking
+      jq -nc --arg env "$e" --arg mcp "${MCP:-}" --arg baked "$baked" --arg bake_repos "${BAKE_REPOS:-}" \
         --arg github "${GITHUB:-off}" --arg egress "${EGRESS:-open}" \
         --arg cpu "${CPU:-4}" --arg mem "${MEMORY:-8GiB}" --argjson boxes "$boxes" \
         --arg secrets "$(grep -c '^[A-Za-z_]' "$d/secrets.env" 2>/dev/null || true)" \
@@ -211,6 +221,7 @@ envs_json() {
         '{env: $env, mcp: $mcp, github: $github, egress: $egress,
           allow: ($allow | split("\n") | map(select(. != ""))),
           cpu: $cpu, memory: $mem, secrets: ($secrets | tonumber? // 0),
+          baked: $baked, bake_repos: ($bake_repos | split(" ") | map(select(. != ""))),
           boxes: [$boxes[] | select(.env == $env) | .box]}' )
   done | jq -sc .
 }
@@ -219,16 +230,54 @@ env_cmd() {
   case "$sub" in
     new) env_new "$@" ;;
     ls) show "$(envs_json)" "no envs (lxs env new <env>)" \
-          '{env, mcp, github, egress, allowed: (.allow | length), boxes: (.boxes | length)}' ;;
+          '{env, mcp, github, egress, allowed: (.allow | length), baked: (if .baked == "" then "-" else .baked end), boxes: (.boxes | length)}' ;;
+    bake) env_bake "$@" ;;
+    unbake) need_env "${1:?env}"; lxc delete -f "$BAKED-$1" 2>/dev/null && echo "env $1: boxes start from golden again" || echo "env $1 is not baked" ;;
     show) need_env "${1:?env}"; show_obj "$(envs_json | jq -c --arg e "$1" '.[] | select(.env == $e)')" ;;
     edit) need_env "$1"; "${EDITOR:-vi}" "$LXSANDBOX_HOME/envs/$1/${2:-env.conf}" ;;
     rm) need_env "$1"; local used
         used=$(lxc list -f csv -c n | while read -r n; do
                  if [ "$(lxc config get "$n" user.lxsandbox.env 2>/dev/null)" = "$1" ]; then echo "$n"; fi; done | paste -sd' ' -)
         [ -z "$used" ] || die "env $1 still used by: $used (lxs rm them first)"
+        lxc delete -f "$BAKED-$1" 2>/dev/null || true
         rm -rf "${LXSANDBOX_HOME:?}/envs/$1"; echo "removed env $1" ;;
-    *) die "lxs env new|ls|show|edit|rm" ;;
+    *) die "lxs env new|ls|show|edit|bake|unbake|rm" ;;
   esac
+}
+
+# ---------- bake: an env's own base snapshot, with repos' docker images and build cache already in it ----------
+# Built like a box (same devices, egress, secrets) as $BAKING-<env>, then stripped of everything per-box
+# and kept as $BAKED-<env>/base. New boxes of the env copy that instead of golden; their /work is cloned fresh.
+BAKE_DEFAULT='set -e
+for d in /work/*/; do cd "$d"
+  if ls compose.y*ml docker-compose.y*ml >/dev/null 2>&1; then
+    echo "  bake ${d%/}: docker compose"; docker compose pull -q --ignore-buildable || true; docker compose build
+  elif [ -f Dockerfile ]; then
+    n=$(basename "$d" | tr A-Z a-z); echo "  bake ${d%/}: docker build -t $n"; docker build -q -t "$n" .
+  fi
+done'
+env_bake() {
+  local e=${1:?env}; need_env "$e"; local d="$LXSANDBOX_HOME/envs/$e" t="$BAKING-$e" args=() r
+  [ "$(lxc list "^$t\$" -c n -f csv)" = "$t" ] && box_delete "$t"
+  local repos; repos=$( . "$d/env.conf"; echo "${BAKE_REPOS:-}")
+  for r in $repos; do args+=(--repo "$r"); done
+  echo "baking env $e from golden${repos:+ with $repos}"
+  ( BOX_SRC="$GOLDEN/base" box_new "$t" --env "$e" ${args[@]+"${args[@]}"} >/dev/null ) || { box_delete "$t"; die "bake of $e failed while creating the box"; }
+  local step="$BAKE_DEFAULT"; grep -qv '^#' "$d/bake.sh" 2>/dev/null && step=$(cat "$d/bake.sh")
+  printf '%s\n' "$step" | lxc file push --uid 1000 --gid 1000 --mode 0700 - "$t/home/agent/.box-bake.sh"
+  in_box "$t" 'for _ in $(seq 60); do docker info >/dev/null 2>&1 && break; sleep 1; done; cd /work && bash ~/.box-bake.sh' || { box_delete "$t"; die "bake of $e failed in bake.sh (nothing changed)"; }
+  # strip everything per-box: repos, tokens, proxy credentials; box_new writes them again for each box
+  lxc exec "$t" -- sh -c 'rm -rf /work/* /work/.[!.]* /home/agent/.boxenv /home/agent/.claude.json /home/agent/.box-*.sh \
+    /home/agent/.bash_history /etc/lxsandbox /etc/apt/apt.conf.d/99lxsandbox-proxy /etc/sudoers.d/lxsandbox-proxy \
+    /etc/systemd/system/docker.service.d/lxsandbox-proxy.conf'
+  mcp_revoke "$t"; rm -f "$LXSANDBOX_HOME/egress/$t"
+  lxc stop "$t" --timeout 60 >/dev/null 2>&1 || lxc stop -f "$t"
+  for r in $(lxc query "/1.0/instances/$t" | jq -r '.devices | keys[]'); do lxc config device remove "$t" "$r" >/dev/null; done
+  lxc config unset "$t" user.lxsandbox.env; lxc config unset "$t" user.lxsandbox.mcp 2>/dev/null || true
+  lxc config set "$t" user.lxsandbox.baked="$(date '+%Y-%m-%d %H:%M')"
+  lxc delete -f "$BAKED-$e" 2>/dev/null || true
+  lxc move "$t" "$BAKED-$e" && lxc snapshot "$BAKED-$e" base
+  echo "env $e baked: new boxes start from $BAKED-$e/base (rebake: lxs env bake $e)"
 }
 
 # ---------- repos ----------
@@ -416,8 +465,11 @@ box_new() {
   # shellcheck disable=SC1091
   . "$d/env.conf"
   lxc query "/1.0/instances/$GOLDEN/snapshots/base" >/dev/null 2>&1 || die "no golden snapshot; run: lxs image build"
+  local src=${BOX_SRC:-}
+  [ -n "$src" ] || { lxc query "/1.0/instances/$BAKED-$e/snapshots/base" >/dev/null 2>&1 && src="$BAKED-$e/base"; } || src="$GOLDEN/base"
+  [ "$src" = "$GOLDEN/base" ] || [ -n "${BOX_SRC:-}" ] || echo "  from $src (baked $(lxc config get "$BAKED-$e" user.lxsandbox.baked))"
 
-  lxc copy "$GOLDEN/base" "$b" -c security.nesting=true -c security.syscalls.intercept.mknod=true \
+  lxc copy "$src" "$b" -c security.nesting=true -c security.syscalls.intercept.mknod=true \
     -c security.syscalls.intercept.setxattr=true -c limits.cpu="${CPU:-4}" -c limits.memory="${MEMORY:-8GiB}" \
     -c user.lxsandbox.env="$e"
   local mcp_url="" mcp_token="" out

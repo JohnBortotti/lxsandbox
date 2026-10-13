@@ -239,6 +239,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
                             raise ValueError(f"bad repo: {r}")
                         args += ["--repo", r]
                 return self.send(200, {"job": job(args)})
+            if op == "bake":
+                env = d.get("env", "")
+                if not NAME.match(env) or env.startswith("-"):
+                    raise ValueError("bad env")
+                return self.send(200, {"job": job(["env", "bake", env])})
             b = self.box(d)
             if op == "run":
                 agent = d.get("agent")

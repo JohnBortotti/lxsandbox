@@ -129,12 +129,13 @@ function renderHome() {
     <section>${boxes.length ? `<div class="stack">${boxes.map(boxRow).join("")}</div>`
       : `<div class="empty"><b>No boxes yet</b><p>Create one to give an agent its own sandbox.</p><button class="btn" onclick="openNewBox()">New Box</button></div>`}</section>
     <section><div class="sec-label">Envs</div><div class="stack table-wrap"><table>
-      <thead><tr><th>Env</th><th>MCP</th><th>GitHub</th><th>Network</th><th>Allowed hosts</th><th>CPU / Memory</th><th>Boxes</th></tr></thead><tbody>
-      ${(S.envs || []).map((e) => `<tr><td class="mono">${esc(e.env)}</td><td class="mono muted">${esc(e.mcp || "–")}</td><td class="muted">${esc(e.github)}</td>
+      <thead><tr><th>Env</th><th>MCP</th><th>GitHub</th><th>Network</th><th>Allowed hosts</th><th>CPU / Memory</th><th>Base</th><th>Boxes</th><th></th></tr></thead><tbody>
+      ${(S.envs || []).map((e) => `<tr><td class="mono">${esc(e.env)}</td><td class="mono muted">${esc(e.mcp || "–")}</td><td class="muted" title="${e.github === "host" ? "Boxes use the host's GitHub identity: ssh-agent + gh login forwarded in (keys stay on the host)" : "Boxes get no GitHub credentials"}">${e.github === "host" ? "host login" : "none"}</td>
         <td><span class="chip ${e.egress === "open" ? "warn" : ""}">${esc(e.egress)}</span></td>
         <td class="num">${e.egress === "open" ? `<span class="muted">not enforced</span>` : (e.allow || []).length}</td>
-        <td class="num">${esc(e.cpu)} / ${esc(e.memory)}</td><td class="num">${(e.boxes || []).length}</td></tr>`).join("")
-        || `<tr><td colspan="7" class="muted">No envs. Create one with <code>lxs env new &lt;env&gt;</code></td></tr>`}
+        <td class="num">${esc(e.cpu)} / ${esc(e.memory)}</td>${baseCell(e)}<td class="num">${(e.boxes || []).length}</td>
+        <td class="num">${bakeBtn(e)}</td></tr>`).join("")
+        || `<tr><td colspan="9" class="muted">No envs. Create one with <code>lxs env new &lt;env&gt;</code></td></tr>`}
     </tbody></table></div></section>
     <section><div class="sec-label">Accounts</div><div style="display:flex;gap:6px;flex-wrap:wrap">${(S.accounts || []).map((a) =>
       `<span class="chip">${esc(a.agent)} · ${esc(a.account)}</span>`).join("") || `<span class="muted">No accounts. Add one with <code>lxs account add</code></span>`}</div></section>
@@ -352,6 +353,36 @@ function closeTerm() {
 
 // ---------- dialogs ----------
 document.querySelectorAll("dialog [data-close]").forEach((b) => b.addEventListener("click", () => b.closest("dialog").close()));
+
+// An env's base: golden, or its own baked snapshot (lxs env bake) with docker images and build cache in it.
+const baking = new Set();
+function baseCell(e) {
+  if (e.baked === "baking" || baking.has(e.env)) return `<td><span class="state working"><span class="dot working"></span>baking…</span></td>`;
+  return e.baked ? `<td title="${esc((e.bake_repos || []).join(" ") || "no BAKE_REPOS")}"><span class="chip">baked</span> <span class="muted">${esc(e.baked)}</span></td>`
+    : `<td class="muted">golden</td>`;
+}
+function bakeBtn(e) {
+  if (e.baked === "baking" || baking.has(e.env)) return "";
+  return `<button class="btn sm" onclick="bakeEnv('${esc(e.env)}')" title="Build a base for this env's boxes: repos cloned, docker images and build cache kept">${e.baked ? "Rebake" : "Bake"}</button>`;
+}
+async function bakeEnv(env) {
+  const e = (S.envs || []).find((x) => x.env === env);
+  const repos = (e?.bake_repos || []).join(", ") || "none (set BAKE_REPOS in env.conf)";
+  if (!confirm(`Bake env ${env}?\n\nRepos: ${repos}\nRuns setup.sh + bake.sh and keeps the docker images for new boxes. Takes a few minutes; running boxes aren't touched.`)) return;
+  try {
+    const { job } = await api("/api/action", { op: "bake", env });
+    baking.add(env); render(); toast(`Baking ${env}…`);
+    for (;;) {
+      await new Promise((r) => setTimeout(r, 2000));
+      const j = await api(`/api/job?id=${job}`);
+      if (!j.done) continue;
+      baking.delete(env); await refresh();
+      if (j.rc === 0) toast(`Env ${env} baked`);
+      else toast(`Bake of ${env} failed: ${j.out.trim().split("\n").pop()}`, true);
+      return;
+    }
+  } catch (err) { baking.delete(env); toast(err.message, true); render(); }
+}
 
 function openNewBox() {
   const d = $("#newBoxDlg"), f = $("#newBoxForm");
