@@ -190,7 +190,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if "token" in qs:  # first visit from the printed URL: trade it for a cookie
                 if not hmac.compare_digest(qs["token"], self.server.token):
                     return self.send(403, "bad token", "text/plain")
-                return self.send(303, b"", "text/plain", [("Location", "/"), (
+                # A page, not a 303: a redirect chain started from another site (a dashboard link)
+                # would not send the SameSite=Strict cookie. This navigation starts on our own origin.
+                return self.send(200, REDIRECT, "text/html; charset=utf-8", [(
                     "Set-Cookie", f"lxs_ui={self.server.token}; Path=/; HttpOnly; SameSite=Strict; Max-Age=31536000")])
             if not self.authed():
                 return self.send(401, LOCKED, "text/html; charset=utf-8")
@@ -377,6 +379,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             print(f"terminal {b}/{s}: detached (attach exit {proc.returncode})", flush=True)
 
 
+REDIRECT = """<!doctype html><meta charset="utf-8"><title>lxs</title><meta http-equiv="refresh" content="0;url=/">
+<script>location.replace("/")</script>"""
 LOCKED = """<!doctype html><meta charset=utf-8><title>lxsandbox</title>
 <body style="font:14px system-ui;display:grid;place-items:center;height:90vh;color:#666">
 <div>Open the URL that <code>lxs ui</code> printed (it carries the login token).</div>"""
